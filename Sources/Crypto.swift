@@ -56,9 +56,9 @@ enum Crypto {
         }
         var out = [UInt8](repeating: 0, count: data.count)
         var moved = 0
-        let status: Int32 = key.withUnsafeBytes { kb in
-            data.withUnsafeBytes { db in
-                out.withUnsafeMutableBytes { ob in
+        let status: Int32 = key.withUnsafeBytes { (kb: UnsafeRawBufferPointer) -> Int32 in
+            data.withUnsafeBytes { (db: UnsafeRawBufferPointer) -> Int32 in
+                out.withUnsafeMutableBytes { (ob: UnsafeMutableRawBufferPointer) -> Int32 in
                     CCCrypt(op, CCAlgorithm(kCCAlgorithmAES),
                             CCOptions(kCCOptionECBMode),
                             kb.baseAddress, key.count, nil,
