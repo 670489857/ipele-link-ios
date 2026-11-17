@@ -1,0 +1,26 @@
+name: build-ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链信息
+        run: |
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: 编译并打包 IPA
+        run: bash scripts/build_ipa.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IpeleLink-ipa
+          path: build/IpeleLink-unsigned.ipa
+          if-no-files-found: error
