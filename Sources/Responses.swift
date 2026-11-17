@@ -10,6 +10,10 @@ struct Field {
     let s: Int
     let div: Double
     let sc: Int
+
+    init(_ n: String, _ o: Int, _ k: String, _ s: Int, _ div: Double, _ sc: Int) {
+        self.n = n; self.o = o; self.k = k; self.s = s; self.div = div; self.sc = sc
+    }
 }
 
 enum Layout {
