@@ -55,15 +55,18 @@ enum Crypto {
             throw CryptoError(msg: "非法 AES 密钥长度: \(key.count) 字节")
         }
         var out = [UInt8](repeating: 0, count: data.count)
+        let outLen = out.count
+        let keyLen = key.count
+        let inLen = data.count
         var moved = 0
         let status: Int32 = key.withUnsafeBytes { (kb: UnsafeRawBufferPointer) -> Int32 in
             data.withUnsafeBytes { (db: UnsafeRawBufferPointer) -> Int32 in
                 out.withUnsafeMutableBytes { (ob: UnsafeMutableRawBufferPointer) -> Int32 in
                     CCCrypt(op, CCAlgorithm(kCCAlgorithmAES),
                             CCOptions(kCCOptionECBMode),
-                            kb.baseAddress, key.count, nil,
-                            db.baseAddress, data.count,
-                            ob.baseAddress, out.count, &moved)
+                            kb.baseAddress, keyLen, nil,
+                            db.baseAddress, inLen,
+                            ob.baseAddress, outLen, &moved)
                 }
             }
         }
