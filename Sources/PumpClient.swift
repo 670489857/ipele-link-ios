@@ -33,6 +33,7 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var modelInfo = "—"
     @Published var snHint = "未设置（明文通信）"
     @Published var busy = false
+    @Published var lastParsed: ParsedResponse? = nil
     @Published var logs: [LogLine] = []
 
     private var central: CBCentralManager?
@@ -250,6 +251,37 @@ final class PumpClient: NSObject, ObservableObject {
             if f.cmd == pendingCmd {
                 finishPending(f)
             }
+        }
+    }
+
+    /// 通用命令执行：跑任意一条命令，并把结果解析后挂在 lastParsed 上。
+    /// 错误应答帧（LEN=7 且 data[0]<=9）会转成「返回码」结果，不当作业务数据。
+    func runCommand(_ code: Int, payload: [UInt8] = [], padded: Bool? = nil,
+                    completion: @escaping (ParsedResponse?) -> Void = { _ in }) {
+        busy = true
+        send(cmd: code, payload: payload, padded: padded) { [weak self] f in
+            guard let self = self else { return }
+            guard let f = f else {
+                self.lastParsed = nil
+                completion(nil)
+                return
+            }
+            if Responses.isErrorFrame(len: f.data.count + Proto.headerLen, f.data) {
+                let rc = f.data.first.map { Int($0) } ?? -1
+                let meaning = Responses.RSP_CODES[rc] ?? "未定义的返回码"
+                let p = ParsedResponse(cmd: f.cmd,
+                                       name: "RSP " + Cmd.name(f.cmd),
+                                       fields: ["返回码": rc, "含义": meaning],
+                                       raw: f.data, note: "错误应答帧")
+                self.lastParsed = p
+                self.lastAck = "返回码 \(rc) · \(meaning)"
+                completion(p)
+                return
+            }
+            let p = Responses.decode(cmd: f.cmd, data: f.data)
+            self.lastParsed = p
+            self.lastAck = p.name
+            completion(p)
         }
     }
 

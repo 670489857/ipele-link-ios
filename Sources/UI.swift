@@ -96,6 +96,16 @@ struct ContentView: View {
                     }
                 }
 
+                Section(header: Text("全部功能")) {
+                    NavigationLink(destination: AllCommandsView(pump: pump)) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("33 条命令 + 全部写入")
+                            Text("含记录浏览、泵限值、基础率方案、时间同步")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                }
+
                 Section(header: Text("诊断")) {
                     NavigationLink(destination: LogView(pump: pump), isActive: $showLog) {
                         Text("通信日志（\(pump.logs.count)）")
