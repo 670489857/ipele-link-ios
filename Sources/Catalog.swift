@@ -125,117 +125,151 @@ enum SheetKind: String, Identifiable {
     var id: String { rawValue }
 }
 
-struct AllCommandsView: View {
+struct ReadGroupView: View {
     @ObservedObject var pump: PumpClient
-    @Environment(\.dismiss) private var dismiss
+    let group: String
 
     @State private var indexText = "1"
     @State private var result: ParsedResponse? = nil
-    @State private var sheet: SheetKind? = nil
-    @State private var pendingSummary = ""
-    @State private var pendingAction: (() -> Void)? = nil
+    @State private var hint = ""
+
+    private var defs: [CommandDef] { Catalog.grouped(group) }
+    private var needsIndex: Bool { defs.contains { $0.indexBytes > 0 } }
 
     var body: some View {
         List {
+            if !hint.isEmpty {
+                Section { Text(hint).font(.caption).foregroundColor(.orange) }
+            }
             if let r = result { ResultSection(result: r) }
-
-            Section(header: Text("索引（记录类命令用）")) {
-                HStack {
-                    Text("起始索引")
-                    TextField("1", text: $indexText).keyboardType(.numberPad).multilineTextAlignment(.trailing)
+            if needsIndex {
+                Section(header: Text("起始索引"),
+                        footer: Text("记录类命令的入参。0x00E0–E2 用 1 字节，0x00E3 用 2 字节；单条记录 0x00F8/9/A 的索引字节为推断值。")) {
+                    HStack {
+                        Text("起始索引")
+                        TextField("1", text: $indexText)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                    }
                 }
             }
-
-            ForEach(Catalog.groups, id: \.self) { g in
-                Section(header: Text(g)) {
-                    ForEach(Catalog.grouped(g)) { d in
-                        Button {
-                            run(d)
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(d.title)
-                                    Text(String(format: "0x%04X", d.id)).font(.caption2).foregroundColor(.secondary)
+            Section(header: Text("\(group) · \(defs.count) 条")) {
+                ForEach(defs) { d in
+                    Button { run(d) } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(d.title)
+                                HStack(spacing: 8) {
+                                    Text(String(format: "0x%04X", d.id))
+                                    if !d.note.isEmpty { Text(d.note) }
                                 }
-                                Spacer()
-                                if d.indexBytes > 0 {
-                                    Text("需索引").font(.caption2).foregroundColor(.orange)
-                                }
+                                .font(.caption2).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if d.indexBytes > 0 {
+                                Text("索引").font(.caption2).foregroundColor(.orange)
                             }
                         }
                     }
                 }
             }
+        }
+        .navigationTitle(group)
+    }
 
-            Section(header: Text("写入（会改变泵）")) {
-                Button {
-                    sheet = .infusion
-                } label: { Label("输注面板（0x00A2 / 0x00A3）", systemImage: "drop.fill") }
-                    .foregroundColor(.red)
-                Button {
-                    sheet = .limits
-                } label: { Label("泵限值（0x00A0）", systemImage: "gauge") }
-                Button {
-                    sheet = .basal
-                } label: { Label("基础率方案（0x00A1）", systemImage: "chart.bar") }
-                Button {
-                    ask(summary: "把泵时钟同步为手机当前时间？") {
-                        sendDateTime()
-                    }
-                } label: { Text("同步时间（0x00A4）") }
-                Button {
-                    ask(summary: "取消当前的临时基础率？") {
-                        pump.runCommand(Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION)
-                    }
-                } label: { Text("取消临时基础率（0x00A5）") }
-                Button {
-                    ask(summary: "取消当前的大剂量输注？") {
-                        pump.runCommand(Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION)
-                    }
-                } label: { Text("取消大剂量（0x00A6）") }
+    private func run(_ d: CommandDef) {
+        guard pump.connected else {
+            hint = "未连接泵，命令发不出去。先回首页扫描并连接。"
+            return
+        }
+        hint = ""
+        var payload: [UInt8] = []
+        if d.indexBytes > 0 {
+            let idx = Int(indexText.trimmingCharacters(in: .whitespaces)) ?? 1
+            payload = d.indexBytes == 1
+                ? [UInt8(max(0, min(255, idx)))]
+                : [UInt8((idx >> 8) & 0xFF), UInt8(idx & 0xFF)]
+        }
+        pump.runCommand(d.id, payload: payload) { p in
+            DispatchQueue.main.async { self.result = p }
+        }
+    }
+}
+
+struct WritesView: View {
+    @ObservedObject var pump: PumpClient
+    @State private var sheet: SheetKind? = nil
+    @State private var pendingSummary = ""
+    @State private var pendingAction: (() -> Void)? = nil
+    @State private var hint = ""
+
+    var body: some View {
+        List {
+            Section(footer: Text("未连接时只能浏览参数，下发会先被本地拒绝。")) {
+                Text("所有写入都要二次确认（3 秒倒计时），超时不会自动重发。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            if !hint.isEmpty {
+                Section { Text(hint).font(.caption).foregroundColor(.orange) }
+            }
+            Section(header: Text("输注")) {
+                Button { open(.infusion) } label: {
+                    Label("输注面板（0x00A2 / 0x00A3）", systemImage: "drop.fill").foregroundColor(.red)
+                }
+                Button { ask("取消当前的临时基础率？") { pump.runCommand(Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION) } } label: {
+                    Text("取消临时基础率（0x00A5）")
+                }
+                Button { ask("取消当前的大剂量输注？") { pump.runCommand(Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION) } } label: {
+                    Text("取消大剂量（0x00A6）")
+                }
+            }
+            Section(header: Text("泵配置")) {
+                Button { open(.limits) } label: {
+                    Label("泵限值（0x00A0）", systemImage: "gauge")
+                }
+                Button { open(.basal) } label: {
+                    Label("基础率方案（0x00A1）", systemImage: "chart.bar")
+                }
+                Button { ask("把泵时钟同步为手机当前时间？") { sendDateTime() } } label: {
+                    Text("同步时间（0x00A4）")
+                }
             }
         }
-        .navigationTitle("全部功能")
-        .toolbar {
-        }
+        .navigationTitle("写入")
         .sheet(item: $sheet) { kind in
             switch kind {
-            case .infusion:
-                InfusionSheet(pump: pump)
-            case .limits:
-                LimitsSheet(pump: pump)
-            case .basal:
-                BasalSheet(pump: pump)
+            case .infusion: InfusionSheet(pump: pump)
+            case .limits: LimitsSheet(pump: pump)
+            case .basal: BasalSheet(pump: pump)
             case .confirm:
                 ConfirmView(summary: pendingSummary) {
                     pendingAction?()
                     pendingAction = nil
                     sheet = nil
-                    pump.log("OK", "已下发：\(pendingSummary)")
                 }
             }
         }
     }
 
-    private func ask(summary: String, action: @escaping () -> Void) {
+    private func online() -> Bool {
+        if !pump.connected {
+            hint = "未连接泵：先在首页扫描并连接，再回来下发。"
+            return false
+        }
+        hint = ""
+        return true
+    }
+
+    private func open(_ k: SheetKind) {
+        guard online() else { return }
+        sheet = k
+    }
+
+    private func ask(_ summary: String, action: @escaping () -> Void) {
+        guard online() else { return }
         pendingSummary = summary
         pendingAction = action
         sheet = .confirm
-    }
-
-    private func run(_ d: CommandDef) {
-        var payload: [UInt8] = []
-        if d.indexBytes > 0 {
-            let idx = Int(indexText.trimmingCharacters(in: .whitespaces)) ?? 1
-            if d.indexBytes == 1 {
-                payload = [UInt8(max(0, min(255, idx)))]
-            } else {
-                payload = [UInt8((idx >> 8) & 0xFF), UInt8(idx & 0xFF)]
-            }
-        }
-        pump.runCommand(d.id, payload: payload) { p in
-            DispatchQueue.main.async { self.result = p }
-        }
     }
 
     private func sendDateTime() {

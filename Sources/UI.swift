@@ -96,11 +96,20 @@ struct ContentView: View {
                     }
                 }
 
-                Section(header: Text("全部功能")) {
-                    NavigationLink(destination: AllCommandsView(pump: pump)) {
+                Section(header: Text("功能（不用连泵也能进）")) {
+                    NavigationLink(destination: ReadGroupView(pump: pump, group: "状态与设置")) {
+                        entry("状态与设置", "14 条只读：药量、报警、IOB、每小时量…")
+                    }
+                    NavigationLink(destination: ReadGroupView(pump: pump, group: "记录")) {
+                        entry("记录", "9 条：四组记录、单条记录、条数统计")
+                    }
+                    NavigationLink(destination: ReadGroupView(pump: pump, group: "系统与工厂")) {
+                        entry("系统与工厂", "3 条：系统设置、工厂模式、版本")
+                    }
+                    NavigationLink(destination: WritesView(pump: pump)) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("33 条命令 + 全部写入")
-                            Text("含记录浏览、泵限值、基础率方案、时间同步")
+                            Text("写入（危险）").foregroundColor(.red)
+                            Text("7 类：输注、取消、泵限值、基础率、时间")
                                 .font(.caption2).foregroundColor(.secondary)
                         }
                     }
@@ -127,6 +136,13 @@ struct ContentView: View {
             .onAppear {
                 pump.configure(sn: sn, paddedEmpty: paddedEmpty)
             }
+        }
+    }
+
+    private func entry(_ title: String, _ sub: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(sub).font(.caption2).foregroundColor(.secondary)
         }
     }
 }
