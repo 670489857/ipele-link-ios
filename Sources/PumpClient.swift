@@ -35,6 +35,9 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var busy = false
     @Published var lastParsed: ParsedResponse? = nil
     @Published var logs: [LogLine] = []
+    @Published var waterTest = false
+    @Published var selfCheckText = ""
+    @Published var verifyText = ""
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -53,6 +56,8 @@ final class PumpClient: NSObject, ObservableObject {
     private var txChunks: [Data] = []
     private var txIndex = 0
     private var lastSendAt = Date.distantPast
+    private var doses: [(Date, Double)] = []
+    private let lastDeviceKey = "ipele.lastPeripheral"
 
     // ------------------------------------------------------------ 配置
 
@@ -128,6 +133,7 @@ final class PumpClient: NSObject, ObservableObject {
     // ------------------------------------------------------------ 收发
 
     func send(cmd: Int, payload: [UInt8] = [], padded: Bool? = nil,
+              allowNegotiate: Bool = true,
               completion: ((Frame?) -> Void)? = nil) {
         guard connected, let wc = writeChar, let p = peripheral else {
             completion?(nil)
@@ -140,9 +146,9 @@ final class PumpClient: NSObject, ObservableObject {
             return
         }
 
+        let usePadded = padded ?? (payload.isEmpty && paddedEmpty)
         seq = seq &+ 1
-        let raw = Proto.build(cmd: cmd, data: payload, seq: Int(seq),
-                              padded: padded ?? (payload.isEmpty && paddedEmpty))
+        let raw = Proto.build(cmd: cmd, data: payload, seq: Int(seq), padded: usePadded)
         let tx: [UInt8]
         if let k = key {
             do {
@@ -163,6 +169,13 @@ final class PumpClient: NSObject, ObservableObject {
 
         let item = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
+            if payload.isEmpty && allowNegotiate {
+                self.log("SYS", "0x\(String(format: "%04X", cmd)) 超时，改用 LEN=\(usePadded ? 6 : 7) 再试一次")
+                self.clearPending()
+                self.send(cmd: cmd, payload: payload, padded: !usePadded,
+                          allowNegotiate: false, completion: completion)
+                return
+            }
             self.log("RSP", "0x\(String(format: "%04X", cmd)) 超时 \(Proto.responseTimeoutMs)ms，未自动重发")
             self.lastAck = "超时"
             self.finishPending(nil)
@@ -202,15 +215,20 @@ final class PumpClient: NSObject, ObservableObject {
         p.writeValue(txChunks[txIndex], for: c, type: .withResponse)
     }
 
-    private func finishPending(_ f: Frame?) {
+    private func clearPending() {
         timeoutItem?.cancel()
         timeoutItem = nil
-        let cb = pendingCB
         pendingCB = nil
+        pendingCmd = 0
         txChunks = []
         txIndex = 0
-        cb?(f)
+    }
+
+    private func finishPending(_ f: Frame?) {
+        let cb = pendingCB
+        clearPending()
         busy = false
+        cb?(f)
     }
 
     // ------------------------------------------------------------ 通知处理
@@ -257,9 +275,11 @@ final class PumpClient: NSObject, ObservableObject {
     /// 通用命令执行：跑任意一条命令，并把结果解析后挂在 lastParsed 上。
     /// 错误应答帧（LEN=7 且 data[0]<=9）会转成「返回码」结果，不当作业务数据。
     func runCommand(_ code: Int, payload: [UInt8] = [], padded: Bool? = nil,
+                    verify: Bool = false,
                     completion: @escaping (ParsedResponse?) -> Void = { _ in }) {
         busy = true
-        send(cmd: code, payload: payload, padded: padded) { [weak self] f in
+        let isWrite = (0x00A0...0x00A6).contains(code)
+        send(cmd: code, payload: payload, padded: padded, allowNegotiate: !isWrite) { [weak self] f in
             guard let self = self else { return }
             guard let f = f else {
                 self.lastParsed = nil
@@ -282,7 +302,129 @@ final class PumpClient: NSObject, ObservableObject {
             self.lastParsed = p
             self.lastAck = p.name
             completion(p)
+            if verify { self.verifyAfterWrite(code) }
         }
+    }
+
+    // ------------------------------------------------------------ 会话剂量 / 自检 / 回读
+
+    func sessionTotal() -> Double {
+        let now = Date()
+        doses = doses.filter { now.timeIntervalSince($0.0) < 3600 }
+        return doses.reduce(0) { $0 + $1.1 }
+    }
+
+    private func recordDose(_ u: Double) {
+        if u > 0 { doses.append((Date(), u)) }
+    }
+
+    /// 两段式自检：先读版本，再读状态，把结论直接写出来，省得翻日志。
+    func selfCheck() {
+        guard connected else {
+            selfCheckText = "未连接：先扫描并连接泵，再自检"
+            return
+        }
+        selfCheckText = "① 读版本 0x00E9 …"
+        send(cmd: Cmd.GET_VERSION) { [weak self] f1 in
+            guard let self = self else { return }
+            if f1 == nil {
+                self.send(cmd: Cmd.GET_REMAINMED_AND_ISWITCH) { f2 in
+                    let text: String
+                    if f2 == nil {
+                        text = "失败：0x00E9 与 0x00F0 都无回包。\n→ 先核对 SN 末 8 位是否纯 0-9/A-F；再看泵是否已被别的手机占用；最后确认蓝牙权限。"
+                    } else {
+                        text = "基本通过：0x00F0 有回包，说明帧格式与加密都对；该固件只是不支持版本命令。"
+                    }
+                    DispatchQueue.main.async { self.selfCheckText = text }
+                }
+                return
+            }
+            self.send(cmd: Cmd.GET_REMAINMED_AND_ISWITCH) { f2 in
+                let text: String
+                if f2 == nil {
+                    text = "半通过：版本有回包、状态无回包。\n→ 多为泵忙或输注开关未开，隔 2 秒再自检一次。"
+                } else {
+                    let p = Responses.decode(cmd: 0x80F0, data: f2!.data)
+                    let rem = p.dbl("remaining_dosage").map { String(format: "%.2fU", $0) } ?? "?"
+                    let sw = p.int("infusion_switch") == 1 ? "开" : "关"
+                    text = "通过：加密与帧格式正常。\n剩余药量 \(rem)，输注开关 \(sw)。"
+                }
+                DispatchQueue.main.async { self.selfCheckText = text }
+            }
+        }
+    }
+
+    /// 写入后回读校验：把「发出去的」和「泵上报的」并排看。
+    func verifyAfterWrite(_ written: Int, expected: [String: String] = [:]) {
+        var readCmd = Cmd.GET_REMAINMED_AND_ISWITCH
+        switch written {
+        case Cmd.SET_INFUSION_PARAMETERS:
+            readCmd = Cmd.GET_ALL_INFUSION_SETTING_INFORMATION
+        case Cmd.SET_BASIC_VOLUME_INFUSION_PARAMETERS:
+            readCmd = Cmd.GET_BASIC_QUANTITY_PLAN
+        case Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION:
+            readCmd = Cmd.GET_TEMPORARY_BASIC_QUANTITY_PLAN
+        default:
+            readCmd = Cmd.GET_REMAINMED_AND_ISWITCH
+        }
+        DispatchQueue.main.async {
+            self.verifyText = "回读 0x\(String(format: "%04X", readCmd)) 中…"
+        }
+        send(cmd: readCmd) { [weak self] f in
+            guard let self = self else { return }
+            guard let f = f else {
+                DispatchQueue.main.async {
+                    self.verifyText = "回读失败：0x\(String(format: "%04X", readCmd)) 无应答 → 写入是否生效未知，请人工看泵屏幕"
+                }
+                return
+            }
+            let p = Responses.decode(cmd: f.cmd, data: f.data)
+            var lines: [String] = ["回读 \(p.name)"]
+            var mismatch = false
+            for (k, v) in expected.sorted(by: { $0.key < $1.key }) {
+                let got = p.fields[k].map { "\($0)" } ?? "—"
+                let same = self.matchValue(got, v)
+                if !same { mismatch = true }
+                lines.append("\(k)：写入 \(v) / 泵上报 \(got) \(same ? "✓" : "✗")")
+            }
+            if expected.isEmpty { lines.append(p.summary) }
+            lines.append(mismatch ? "结论：不一致，写入可能未被泵接受" : "结论：一致")
+            let text = lines.joined(separator: "\n")
+            DispatchQueue.main.async { self.verifyText = text }
+        }
+    }
+
+    private func matchValue(_ got: String, _ want: String) -> Bool {
+        if let g = Double(got), let w = Double(want) { return abs(g - w) < 0.011 }
+        return got == want
+    }
+
+    // ------------------------------------------------------------ 重连
+
+    var hasLastDevice: Bool {
+        UserDefaults.standard.string(forKey: lastDeviceKey) != nil
+    }
+
+    func reconnectLast() {
+        if central == nil {
+            central = CBCentralManager(delegate: self, queue: nil)
+        }
+        guard let c = central else { return }
+        guard let s = UserDefaults.standard.string(forKey: lastDeviceKey), let uuid = UUID(uuidString: s) else {
+            log("SYS", "没有上次连接的记录，请先扫描")
+            return
+        }
+        let found = c.retrievePeripherals(withIdentifiers: [uuid])
+        guard let p = found.first else {
+            log("ERR", "系统里找不到上次的设备（可能已关机或蓝牙重置），请重新扫描")
+            return
+        }
+        connecting = true
+        currentName = p.name ?? "上次的设备"
+        peripheral = p
+        p.delegate = self
+        c.connect(p, options: nil)
+        log("SYS", "重连上次设备 \(currentName)")
     }
 
     // ------------------------------------------------------------ 便捷动作
@@ -308,28 +450,42 @@ final class PumpClient: NSObject, ObservableObject {
     }
 
     func sendBolus(units: Double, minutes: Int = 0, waveform: Int = 0) -> Guard.Result {
-        let g = Guard.checkBolus(units: units, remaining: remainingU, switchOn: switchOn)
+        let g = Guard.checkBolus(units: units, remaining: remainingU, switchOn: switchOn,
+                                 sessionUnits: sessionTotal(), waterTest: waterTest)
         guard g.ok else { return g }
         var b = Params.Bolus(unitsValue: units)
         b.minutes = minutes
         b.waveform = waveform
         let payload = b.bytes()
         busy = true
-        send(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, payload: payload) { [weak self] f in
+        recordDose(units)
+        send(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, payload: payload, allowNegotiate: false) { [weak self] f in
             self?.summariseWrite(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, frame: f)
+            self?.verifyAfterWrite(Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION)
         }
         return g
     }
 
     func sendTBR(rate: Double?, percent: Int?, minutes: Int) -> Guard.Result {
         let g = Guard.checkTbr(rate: rate, percent: percent, minutes: minutes,
-                               remaining: remainingU, switchOn: switchOn)
+                               remaining: remainingU, switchOn: switchOn,
+                               sessionUnits: sessionTotal(), waterTest: waterTest)
         guard g.ok else { return g }
         do {
             let payload = try Params.TempBasal(rateUPerHour: rate, percent: percent, minutes: minutes).bytes()
             busy = true
-            send(cmd: Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, payload: payload) { [weak self] f in
+            var expected: [String: String] = ["duration": "\(minutes)"]
+            if let r = rate {
+                expected["speed"] = String(format: "%.2f", r)
+                expected["percentage_switch"] = "0"
+                recordDose(r * Double(minutes) / 60.0)
+            } else {
+                expected["percentage"] = "\(percent ?? 0)"
+                expected["percentage_switch"] = "1"
+            }
+            send(cmd: Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, payload: payload, allowNegotiate: false) { [weak self] f in
                 self?.summariseWrite(cmd: Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, frame: f)
+                self?.verifyAfterWrite(Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, expected: expected)
             }
             return g
         } catch {
@@ -339,14 +495,14 @@ final class PumpClient: NSObject, ObservableObject {
 
     func cancelTBR() {
         busy = true
-        send(cmd: Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION) { [weak self] f in
+        send(cmd: Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION, allowNegotiate: false) { [weak self] f in
             self?.summariseWrite(cmd: Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION, frame: f)
         }
     }
 
     func cancelBolus() {
         busy = true
-        send(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION) { [weak self] f in
+        send(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, allowNegotiate: false) { [weak self] f in
             self?.summariseWrite(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, frame: f)
         }
     }
@@ -423,6 +579,7 @@ extension PumpClient: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastDeviceKey)
         log("SYS", "已连接，发现服务 \(Proto.serviceUUID)")
         peripheral.delegate = self
         peripheral.discoverServices([CBUUID(string: Proto.serviceUUID)])

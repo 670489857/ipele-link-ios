@@ -16,6 +16,9 @@ jobs:
           xcodebuild -version || true
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: 协议测试向量
+        run: bash scripts/run_tests.sh
+
       - name: 编译并打包 IPA
         run: bash scripts/build_ipa.sh
 

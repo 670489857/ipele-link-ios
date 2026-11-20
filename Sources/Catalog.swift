@@ -342,7 +342,7 @@ struct LimitsSheet: View {
         p.maxBasal = Int(maxBasal) ?? 3
         p.limitQuantity = Int(limitQty) ?? 50
         guard let payload = try? p.bytes() else { err = "参数越界"; showConfirm = false; return }
-        pump.runCommand(Cmd.SET_INFUSION_PARAMETERS, payload: payload)
+        pump.runCommand(Cmd.SET_INFUSION_PARAMETERS, payload: payload, verify: true)
         showConfirm = false
     }
 }
@@ -401,7 +401,7 @@ struct BasalSheet: View {
         p.end = 23
         p.points = parsed()
         guard let payload = try? p.bytes() else { err = "参数越界"; showConfirm = false; return }
-        pump.runCommand(Cmd.SET_BASIC_VOLUME_INFUSION_PARAMETERS, payload: payload)
+        pump.runCommand(Cmd.SET_BASIC_VOLUME_INFUSION_PARAMETERS, payload: payload, verify: true)
         showConfirm = false
     }
 }

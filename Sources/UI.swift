@@ -6,6 +6,7 @@ struct ContentView: View {
     @AppStorage("ipele.sn") private var sn: String = ""
     @AppStorage("ipele.padded") private var paddedEmpty: Bool = true
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
     @State private var showInfusion = false
     @State private var showLog = false
@@ -29,6 +30,9 @@ struct ContentView: View {
                     } else {
                         Button(pump.scanning ? "停止扫描" : "扫描附近的泵") {
                             if pump.scanning { pump.stopScan() } else { pump.startScan() }
+                        }
+                        if pump.hasLastDevice {
+                            Button("重连上次设备") { pump.reconnectLast() }
                         }
                     }
                     HStack {
@@ -93,6 +97,19 @@ struct ContentView: View {
                         }
                         Button("取消临时基础率（0x00A5）") { pump.cancelTBR() }
                         Button("取消大剂量（0x00A6）") { pump.cancelBolus() }
+                        Toggle("水测试模式（≤0.5U / ≤1.0U·h⁻¹）", isOn: $pump.waterTest)
+                        if !pump.verifyText.isEmpty {
+                            Text(pump.verifyText)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                Section(header: Text("自检")) {
+                    Button("运行自检（0x00E9 → 0x00F0）") { pump.selfCheck() }
+                    if !pump.selfCheckText.isEmpty {
+                        Text(pump.selfCheckText).font(.caption).foregroundColor(.secondary)
                     }
                 }
 
@@ -135,6 +152,11 @@ struct ContentView: View {
             }
             .onAppear {
                 pump.configure(sn: sn, paddedEmpty: paddedEmpty)
+            }
+            .onChange(of: scenePhase) { phase in
+                if phase == .active && !pump.connected && pump.hasLastDevice {
+                    pump.reconnectLast()
+                }
             }
         }
     }
@@ -253,19 +275,22 @@ struct InfusionSheet: View {
         switch mode {
         case 0:
             guard let u = Guard.parseUnits(amount) else { errorText = "剂量必须是大于 0、最多两位小数的数字"; return }
-            let r = Guard.checkBolus(units: u, remaining: pump.remainingU, switchOn: pump.switchOn)
+            let r = Guard.checkBolus(units: u, remaining: pump.remainingU, switchOn: pump.switchOn,
+                                     sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
             summary = "大剂量 \(String(format: "%.2f", u)) U" + (minutes > 0 ? "，波形时长 \(minutes) min" : "")
         case 1:
             guard let rate = Guard.parseUnits(amount) else { errorText = "速率必须是大于 0 的数字"; return }
             let r = Guard.checkTbr(rate: rate, percent: nil, minutes: minutes,
-                                   remaining: pump.remainingU, switchOn: pump.switchOn)
+                                   remaining: pump.remainingU, switchOn: pump.switchOn,
+                                   sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
             summary = String(format: "临时基础率 %.2f U/h × %d min", rate, minutes)
         default:
             guard let p = Int(percent.trimmingCharacters(in: .whitespaces)) else { errorText = "百分比必须是整数"; return }
             let r = Guard.checkTbr(rate: nil, percent: p, minutes: minutes,
-                                   remaining: pump.remainingU, switchOn: pump.switchOn)
+                                   remaining: pump.remainingU, switchOn: pump.switchOn,
+                                   sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
             summary = "临时基础率 \(p)% × \(minutes) min"
         }
