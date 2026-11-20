@@ -22,13 +22,18 @@ enum Crypto {
         for ch in tail where !ch.isHexDigit {
             throw CryptoError(msg: "序列号后 8 位必须是十六进制字符（0-9 / A-F），发现 '\(ch)'")
         }
+        // 每个字符展开成 "0"+c+"00"，拼成 32 位 hex，再按 2 个字符一个字节解析
+        let hex = tail.map { "0\($0)00" }.joined()
         var out: [UInt8] = []
-        for ch in tail {
-            let s = "0\(ch)00"
-            guard s.count == 4, let v = UInt8(s, radix: 16) else {
-                throw CryptoError(msg: "密钥派生失败：\(s)")
+        var i = hex.startIndex
+        while i < hex.endIndex {
+            let j = hex.index(i, offsetBy: 2)
+            let pair = String(hex[i..<j])
+            guard let v = UInt8(pair, radix: 16) else {
+                throw CryptoError(msg: "密钥派生失败：\(pair)")
             }
             out.append(v)
+            i = j
         }
         return out
     }
