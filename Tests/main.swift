@@ -51,5 +51,36 @@ let f0 = Responses.decode(cmd: 0x80F0, data: [0x01, 0x00, 0x00, 0x13, 0x88])
 check("0x80F0 开关解析", f0.int("infusion_switch") == 1)
 check("0x80F0 剩余药量 50.00", f0.dbl("remaining_dosage") == 50.0, "\(f0.dbl("remaining_dosage") ?? -1)")
 
+// 通知按字节拆分：先来 0x55，再来 0xAA…，整帧不能被丢掉
+let sample = Proto.build(cmd: 0x00F0, data: [], seq: 3, padded: true)
+let asm1 = FrameAssembler()
+let a1 = asm1.feed([sample[0]])
+let a2 = asm1.feed(Array(sample[1...]))
+check("单字节 0x55 保留", a1.isEmpty && a2.count == 1 && a2[0].cmd == 0x80F0, "frames=\(a2.count)")
+
+let asm2 = FrameAssembler()
+let b1 = asm2.feed(Array(sample[0..<3]))
+let b2 = asm2.feed(Array(sample[3...]))
+check("帧跨 3 段重组", b1.isEmpty && b2.count == 1)
+
+let asm3 = FrameAssembler()
+let c1 = asm3.feed(Array(sample[0..<2]))
+let junk = asm3.feed([0x12, 0x34])
+let c2 = asm3.feed(Array(sample[2...]))
+check("垃圾字节后仍能恢复", c1.count + c2.count == 1 && junk.isEmpty)
+
+// 参数越界必须抛错，不能静默截断后下发
+var threwRate = false
+do { _ = try Params.TempBasal(rateUPerHour: 30, percent: nil, minutes: 60).bytes() } catch { threwRate = true }
+check("速率 30U/h 抛错", threwRate)
+
+var threwDose = false
+do { _ = try Params.Bolus(unitsValue: 30).bytes() } catch { threwDose = true }
+check("剂量 30U 抛错", threwDose)
+
+var threwMin = false
+do { _ = try Params.TempBasal(rateUPerHour: 0.5, percent: nil, minutes: 0).bytes() } catch { threwMin = true }
+check("时长 0 分钟抛错", threwMin)
+
 print(failed == 0 ? "ALL PASS" : "\(failed) FAILED")
 exit(failed == 0 ? 0 : 1)

@@ -23,14 +23,24 @@ enum Params {
             }
             var buf = [UInt8](repeating: 0, count: 11)
             if let p = percent {
+                guard (1...200).contains(p) else {
+                    throw Crypto.CryptoError(msg: "百分比 \(p)% 超出 1–200")
+                }
                 buf[0] = 1
-                let u = UInt16(max(0, min(0xFFFF, p)))
+                let u = UInt16(p)
                 buf[5] = UInt8((u >> 8) & 0xFF)
                 buf[6] = UInt8(u & 0xFF)
             } else {
-                let u = units(rateUPerHour!)
+                let r = rateUPerHour!
+                guard r >= 0.01 && r <= 25.0 else {
+                    throw Crypto.CryptoError(msg: String(format: "速率 %.2f U/h 超出可编码范围 0.01–25", r))
+                }
+                let u = units(r)
                 buf[1] = UInt8((u >> 8) & 0xFF)
                 buf[2] = UInt8(u & 0xFF)
+            }
+            guard (1...1440).contains(minutes) else {
+                throw Crypto.CryptoError(msg: "时长 \(minutes) 分钟超出 1–1440")
             }
             let d = UInt16(max(0, min(0xFFFF, minutes)))
             buf[3] = UInt8((d >> 8) & 0xFF)
@@ -48,7 +58,22 @@ enum Params {
         var intervalMinutes: Int = 0
         var intervalSwitch: Int = 0
 
-        func bytes() -> [UInt8] {
+        func bytes() throws -> [UInt8] {
+            guard unitsValue >= 0.01 && unitsValue <= 25.0 else {
+                throw Crypto.CryptoError(msg: String(format: "剂量 %.2fU 超出可编码范围 0.01–25", unitsValue))
+            }
+            guard (0...1440).contains(minutes) else {
+                throw Crypto.CryptoError(msg: "时长 \(minutes) 分钟超出 0–1440")
+            }
+            guard (0...2).contains(waveform) else {
+                throw Crypto.CryptoError(msg: "波形 \(waveform) 超出 0–2")
+            }
+            guard (0...100).contains(dualRatio) else {
+                throw Crypto.CryptoError(msg: "双波比 \(dualRatio) 超出 0–100")
+            }
+            guard (0...1440).contains(intervalMinutes) else {
+                throw Crypto.CryptoError(msg: "间隔 \(intervalMinutes) 分钟超出 0–1440")
+            }
             var buf = [UInt8](repeating: 0, count: 13)
             let u = units(unitsValue)
             buf[0] = UInt8((u >> 8) & 0xFF)
@@ -128,6 +153,12 @@ enum Params {
             let n = end - start + 1
             guard n > 0, points.count == n else {
                 throw Crypto.CryptoError(msg: "基础率点数 \(points.count) 与区间 \(n) 不匹配")
+            }
+            guard (0...23).contains(start), (0...23).contains(end) else {
+                throw Crypto.CryptoError(msg: "起止点必须在 0–23")
+            }
+            for (i, v) in points.enumerated() where !(0...25).contains(v) {
+                throw Crypto.CryptoError(msg: "第 \(i + start) 点 \(v) U/h 超出 0–25")
             }
             var buf = [UInt8](repeating: 0, count: 8 + n * 2)
             buf[0] = UInt8(max(0, min(255, mode)))

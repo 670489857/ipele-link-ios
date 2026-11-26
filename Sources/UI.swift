@@ -85,6 +85,11 @@ struct ContentView: View {
                             Text(pump.remainingU.map { String(format: "%.2f U", $0) } ?? "—")
                         }
                         HStack {
+                            Text("1 小时写入累计")
+                            Spacer()
+                            Text(String(format: "%.2f U", pump.sessionTotal()))
+                        }
+                        HStack {
                             Text("输注开关")
                             Spacer()
                             Text(pump.switchOn == nil ? "—" : (pump.switchOn! ? "开" : "关"))

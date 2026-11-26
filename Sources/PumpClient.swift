@@ -56,8 +56,29 @@ final class PumpClient: NSObject, ObservableObject {
     private var txChunks: [Data] = []
     private var txIndex = 0
     private var lastSendAt = Date.distantPast
-    private var doses: [(Date, Double)] = []
+    private struct DoseEntry: Codable { let at: Date; let units: Double }
+    private var doses: [DoseEntry] = []
+    private let doseKey = "ipele.doses"
     private let lastDeviceKey = "ipele.lastPeripheral"
+    private var connectTimer: DispatchWorkItem?
+
+    // 超时计时改为「最后一包写完后」才开始；这之前用写通道看门狗兜底
+    private var pendingRaw = 0
+    private var pendingPayload: [UInt8] = []
+    private var pendingPadded = true
+    private var pendingAllow = true
+    private var pendingCompletion: ((Frame?) -> Void)?
+    private var timeoutArmed = false
+    private var writeWatchdog: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        if let d = UserDefaults.standard.data(forKey: doseKey),
+           let list = try? JSONDecoder().decode([DoseEntry].self, from: d) {
+            doses = list
+        }
+        pruneDoses()
+    }
 
     // ------------------------------------------------------------ 配置
 
@@ -112,6 +133,7 @@ final class PumpClient: NSObject, ObservableObject {
         peripheral = d.peripheral
         d.peripheral.delegate = self
         c.connect(d.peripheral, options: nil)
+        startConnectTimer()
         log("SYS", "连接 \(d.name) …（命令间隔 \(Proto.queueIntervalMs)ms，响应超时 \(Proto.responseTimeoutMs)ms）")
     }
 
@@ -120,7 +142,21 @@ final class PumpClient: NSObject, ObservableObject {
         cleanup(reason: "主动断开")
     }
 
+    private func startConnectTimer() {
+        connectTimer?.cancel()
+        let t = DispatchWorkItem { [weak self] in
+            guard let self = self, self.connecting else { return }
+            self.log("ERR", "连接 10s 未完成，已取消（泵可能被其他设备占用或已休眠）")
+            if let p = self.peripheral { self.central?.cancelPeripheralConnection(p) }
+            self.cleanup(reason: "连接超时")
+        }
+        connectTimer = t
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: t)
+    }
+
     private func cleanup(reason: String) {
+        connectTimer?.cancel()
+        connectTimer = nil
         connected = false
         connecting = false
         writeChar = nil
@@ -167,21 +203,22 @@ final class PumpClient: NSObject, ObservableObject {
         lastAck = "等待 0x\(String(format: "%04X", cmd)) 应答…"
         log("TX", "0x\(String(format: "%04X", cmd)) \(Cmd.name(cmd))  明文 \(raw.hex)\(key != nil ? "  → 密文 \(tx.count)B" : "")")
 
-        let item = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            if payload.isEmpty && allowNegotiate {
-                self.log("SYS", "0x\(String(format: "%04X", cmd)) 超时，改用 LEN=\(usePadded ? 6 : 7) 再试一次")
-                self.clearPending()
-                self.send(cmd: cmd, payload: payload, padded: !usePadded,
-                          allowNegotiate: false, completion: completion)
-                return
-            }
-            self.log("RSP", "0x\(String(format: "%04X", cmd)) 超时 \(Proto.responseTimeoutMs)ms，未自动重发")
-            self.lastAck = "超时"
+        pendingRaw = cmd
+        pendingPayload = payload
+        pendingPadded = usePadded
+        pendingAllow = allowNegotiate
+        pendingCompletion = completion
+        timeoutArmed = false
+
+        let wd = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pendingCB != nil, !self.timeoutArmed else { return }
+            self.log("ERR", "写通道 5s 内没有完成回调，按失败处理")
+            self.lastAck = "写入失败"
             self.finishPending(nil)
         }
-        timeoutItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Proto.responseTimeoutMs), execute: item)
+        writeWatchdog?.cancel()
+        writeWatchdog = wd
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: wd)
 
         sendNextChunk(tx, peripheral: p, characteristic: wc)
     }
@@ -213,13 +250,45 @@ final class PumpClient: NSObject, ObservableObject {
         guard txIndex < txChunks.count else { return }
         lastSendAt = Date()
         p.writeValue(txChunks[txIndex], for: c, type: .withResponse)
+        // 最后一包已交给蓝牙栈，此时才开始算应答超时（避免还在分包写就重发）
+        if txIndex == txChunks.count - 1 { armResponseTimeout() }
+    }
+
+    private func armResponseTimeout() {
+        guard !timeoutArmed, pendingCB != nil else { return }
+        timeoutArmed = true
+        writeWatchdog?.cancel()
+        let cmd = pendingRaw
+        let payload = pendingPayload
+        let usePadded = pendingPadded
+        let allow = pendingAllow
+        let completion = pendingCompletion
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pendingCB != nil else { return }
+            if payload.isEmpty && allow {
+                self.log("SYS", "0x\(String(format: "%04X", cmd)) 超时，改用 LEN=\(usePadded ? 6 : 7) 再试一次")
+                self.clearPending()
+                self.send(cmd: cmd, payload: payload, padded: !usePadded,
+                          allowNegotiate: false, completion: completion)
+                return
+            }
+            self.log("RSP", "0x\(String(format: "%04X", cmd)) 超时 \(Proto.responseTimeoutMs)ms，未自动重发")
+            self.lastAck = "超时"
+            self.finishPending(nil)
+        }
+        timeoutItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Proto.responseTimeoutMs), execute: item)
     }
 
     private func clearPending() {
         timeoutItem?.cancel()
         timeoutItem = nil
+        writeWatchdog?.cancel()
+        writeWatchdog = nil
         pendingCB = nil
         pendingCmd = 0
+        pendingCompletion = nil
+        timeoutArmed = false
         txChunks = []
         txIndex = 0
     }
@@ -309,13 +378,36 @@ final class PumpClient: NSObject, ObservableObject {
     // ------------------------------------------------------------ 会话剂量 / 自检 / 回读
 
     func sessionTotal() -> Double {
-        let now = Date()
-        doses = doses.filter { now.timeIntervalSince($0.0) < 3600 }
-        return doses.reduce(0) { $0 + $1.1 }
+        pruneDoses()
+        return doses.reduce(0) { $0 + $1.units }
+    }
+
+    private func pruneDoses() {
+        let cutoff = Date().addingTimeInterval(-3600)
+        doses = doses.filter { $0.at > cutoff }
+    }
+
+    private func persistDoses() {
+        if let d = try? JSONEncoder().encode(doses) {
+            UserDefaults.standard.set(d, forKey: doseKey)
+        }
     }
 
     private func recordDose(_ u: Double) {
-        if u > 0 { doses.append((Date(), u)) }
+        guard u > 0 else { return }
+        pruneDoses()
+        doses.append(DoseEntry(at: Date(), units: u))
+        persistDoses()
+    }
+
+    /// 只有泵明确应答、且不是错误码时才算「这次写入可能生效」。
+    /// 超时/被拒都等于泵可能没执行，计进 1 小时窗口会误拦后续合法剂量。
+    private func ackAccepted(_ f: Frame?) -> Bool {
+        guard let f = f else { return false }
+        if Responses.isErrorFrame(len: f.data.count + Proto.headerLen, f.data) {
+            return (f.data.first.map { Int($0) } ?? -1) == 0
+        }
+        return true
     }
 
     /// 两段式自检：先读版本，再读状态，把结论直接写出来，省得翻日志。
@@ -424,6 +516,7 @@ final class PumpClient: NSObject, ObservableObject {
         peripheral = p
         p.delegate = self
         c.connect(p, options: nil)
+        startConnectTimer()
         log("SYS", "重连上次设备 \(currentName)")
     }
 
@@ -456,12 +549,16 @@ final class PumpClient: NSObject, ObservableObject {
         var b = Params.Bolus(unitsValue: units)
         b.minutes = minutes
         b.waveform = waveform
-        let payload = b.bytes()
+        let payload: [UInt8]
+        do { payload = try b.bytes() } catch {
+            return Guard.Result(ok: false, msg: error.localizedDescription)
+        }
         busy = true
-        recordDose(units)
         send(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, payload: payload, allowNegotiate: false) { [weak self] f in
-            self?.summariseWrite(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, frame: f)
-            self?.verifyAfterWrite(Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION)
+            guard let self = self else { return }
+            self.summariseWrite(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, frame: f)
+            if self.ackAccepted(f) { self.recordDose(units) }
+            self.verifyAfterWrite(Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION)
         }
         return g
     }
@@ -478,14 +575,17 @@ final class PumpClient: NSObject, ObservableObject {
             if let r = rate {
                 expected["speed"] = String(format: "%.2f", r)
                 expected["percentage_switch"] = "0"
-                recordDose(r * Double(minutes) / 60.0)
             } else {
                 expected["percentage"] = "\(percent ?? 0)"
                 expected["percentage_switch"] = "1"
             }
             send(cmd: Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, payload: payload, allowNegotiate: false) { [weak self] f in
-                self?.summariseWrite(cmd: Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, frame: f)
-                self?.verifyAfterWrite(Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, expected: expected)
+                guard let self = self else { return }
+                self.summariseWrite(cmd: Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, frame: f)
+                if let r = rate, self.ackAccepted(f) {
+                    self.recordDose(r * Double(minutes) / 60.0)
+                }
+                self.verifyAfterWrite(Cmd.TRIGGER_TEMPORARY_BASIC_VOLUME_INFUSION, expected: expected)
             }
             return g
         } catch {
@@ -579,6 +679,8 @@ extension PumpClient: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        connectTimer?.cancel()
+        connectTimer = nil
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastDeviceKey)
         log("SYS", "已连接，发现服务 \(Proto.serviceUUID)")
         peripheral.delegate = self
@@ -586,6 +688,8 @@ extension PumpClient: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        connectTimer?.cancel()
+        connectTimer = nil
         connecting = false
         log("ERR", "连接失败：\(error?.localizedDescription ?? "未知")")
     }

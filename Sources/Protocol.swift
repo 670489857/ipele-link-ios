@@ -70,7 +70,13 @@ final class FrameAssembler {
         buf.append(contentsOf: bytes)
         var out: [Frame] = []
         while true {
-            guard let idx = startIndex() else { buf.removeAll(); break }
+            guard let idx = startIndex() else {
+                // 没有帧头：只保留结尾可能属于下一帧起始的 0x55，
+                // 否则一旦通知按字节拆开（先来 55、再来 AA…），整帧会被丢掉。
+                let keep = (!buf.isEmpty && buf.last == Proto.start1) ? 1 : 0
+                if buf.count > keep { buf.removeFirst(buf.count - keep) }
+                break
+            }
             if idx > 0 { buf.removeFirst(idx) }
             if buf.count < 3 { break }
             let total = Int(buf[2]) + Proto.crcLen
