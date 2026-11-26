@@ -38,6 +38,8 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var waterTest = false
     @Published var selfCheckText = ""
     @Published var verifyText = ""
+    @Published var basalRateNow: Double? = nil
+    @Published var basalText = "未读取"
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -64,6 +66,7 @@ final class PumpClient: NSObject, ObservableObject {
 
     // 超时计时改为「最后一包写完后」才开始；这之前用写通道看门狗兜底
     private var pendingRaw = 0
+    private var pendingSeq = 0
     private var pendingPayload: [UInt8] = []
     private var pendingPadded = true
     private var pendingAllow = true
@@ -139,6 +142,8 @@ final class PumpClient: NSObject, ObservableObject {
 
     func disconnect() {
         if let p = peripheral { central?.cancelPeripheralConnection(p) }
+        basalRateNow = nil
+        basalText = "未读取"
         cleanup(reason: "主动断开")
     }
 
@@ -204,6 +209,7 @@ final class PumpClient: NSObject, ObservableObject {
         log("TX", "0x\(String(format: "%04X", cmd)) \(Cmd.name(cmd))  明文 \(raw.hex)\(key != nil ? "  → 密文 \(tx.count)B" : "")")
 
         pendingRaw = cmd
+        pendingSeq = Int(seq)
         pendingPayload = payload
         pendingPadded = usePadded
         pendingAllow = allowNegotiate
@@ -335,7 +341,11 @@ final class PumpClient: NSObject, ObservableObject {
                 lastAck = "0x\(String(format: "%04X", f.cmd)) 数据"
                 log("DEC", "\(parsed.name)：\(parsed.summary)")
             }
-            if f.cmd == pendingCmd {
+            // 厂商固件有的回 cmd|0x8000，有的原样回 cmd；两种都认，seq 不一致只记日志不丢弃。
+            if f.cmd == pendingCmd || (pendingRaw != 0 && f.cmd == pendingRaw) {
+                if f.seq != pendingSeq && f.seq != 0 {
+                    log("RSP", "seq 不一致（泵 \(f.seq) / 本机 \(pendingSeq)），仍按 cmd 匹配接受")
+                }
                 finishPending(f)
             }
         }
@@ -522,6 +532,41 @@ final class PumpClient: NSObject, ObservableObject {
 
     // ------------------------------------------------------------ 便捷动作
 
+    /// 读基础量方案（0x00F2），取当前小时的基础率。
+    /// 百分比 TBR 必须先有它，否则算不出绝对剂量。
+    func readBasalPlan() {
+        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN) { [weak self] p in
+            guard let self = self else { return }
+            guard let p = p, let raw = p.fields["point_list"] as? [String: Double] else {
+                self.basalText = "读取失败：0x00F2 无有效点表"
+                return
+            }
+            var map: [Int: Double] = [:]
+            for (k, v) in raw { if let h = Int(k) { map[h] = v } }
+            let hour = Calendar.current.component(.hour, from: Date())
+            let rate = self.rateForHour(hour, map)
+            self.basalRateNow = rate
+            if let r = rate {
+                self.basalText = String(format: "%02d:00 起 %.2f U/h（%d 个时段）", self.hourKey(hour, map), r, map.count)
+            } else {
+                self.basalText = "点表为空"
+            }
+            self.log("OK", "基础率 \(self.basalText)")
+        }
+    }
+
+    private func rateForHour(_ h: Int, _ map: [Int: Double]) -> Double? {
+        if let v = map[h] { return v }
+        let lower = map.keys.filter { $0 <= h }.max()
+        if let k = lower { return map[k] }
+        return map.keys.min().flatMap { map[$0] }
+    }
+
+    private func hourKey(_ h: Int, _ map: [Int: Double]) -> Int {
+        if map[h] != nil { return h }
+        return map.keys.filter { $0 <= h }.max() ?? (map.keys.min() ?? 0)
+    }
+
     func refreshStatus() {
         busy = true
         send(cmd: Cmd.GET_REMAINMED_AND_ISWITCH) { [weak self] f in
@@ -566,7 +611,8 @@ final class PumpClient: NSObject, ObservableObject {
     func sendTBR(rate: Double?, percent: Int?, minutes: Int) -> Guard.Result {
         let g = Guard.checkTbr(rate: rate, percent: percent, minutes: minutes,
                                remaining: remainingU, switchOn: switchOn,
-                               sessionUnits: sessionTotal(), waterTest: waterTest)
+                               sessionUnits: sessionTotal(), waterTest: waterTest,
+                               basalRate: basalRateNow)
         guard g.ok else { return g }
         do {
             let payload = try Params.TempBasal(rateUPerHour: rate, percent: percent, minutes: minutes).bytes()
@@ -725,6 +771,9 @@ extension PumpClient: CBPeripheralDelegate {
             connected = true
             connecting = false
             log("SYS", "链路就绪")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.readBasalPlan()
+            }
         } else {
             log("ERR", "没找到 FFF2 写通道，无法下发命令")
         }

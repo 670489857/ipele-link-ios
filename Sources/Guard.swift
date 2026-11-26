@@ -50,9 +50,13 @@ enum Guard {
         return Result(ok: true, msg: String(format: "大剂量 %.2fU 通过本地校验", units))
     }
 
+    /// - Parameter basalRate: 当前基础率（U/h）。百分比模式必须提供：
+    ///   泵是按「基础率 × 百分比」输注的，不先读 0x00F2 就算不出绝对剂量，
+    ///   3U/h 与 15U/h 两道上限会被绕过去。
     static func checkTbr(rate: Double?, percent: Int?, minutes: Int,
                          remaining: Double?, switchOn: Bool?,
-                         sessionUnits: Double = 0, waterTest: Bool = false) -> Result {
+                         sessionUnits: Double = 0, waterTest: Bool = false,
+                         basalRate: Double? = nil) -> Result {
         if rate != nil && percent != nil { return Result(ok: false, msg: "速率与百分比只能填一个") }
         if rate == nil && percent == nil { return Result(ok: false, msg: "请填写速率或百分比") }
         if minutes < minTbrMin || minutes > maxTbrMin {
@@ -85,6 +89,23 @@ enum Guard {
         if p <= 0 || p > maxPercent {
             return Result(ok: false, msg: "百分比必须在 1..\(maxPercent)")
         }
-        return Result(ok: true, msg: "临时基础率 \(p)% × \(minutes)min 通过本地校验")
+        guard let b = basalRate, b > 0 else {
+            return Result(ok: false, msg: "百分比模式需要先读基础率（0x00F2）：读不到就当基础率未知，不能下发")
+        }
+        let implied = b * Double(p) / 100.0
+        if implied > maxTbrRate {
+            return Result(ok: false, msg: String(format: "换算后 %.2fU/h（%.2f × %d%%）超过本地硬上限 %.2fU/h", implied, b, p, maxTbrRate))
+        }
+        if waterTest && implied > waterMaxTbr {
+            return Result(ok: false, msg: String(format: "水测试模式换算后 %.2fU/h 超过 %.2fU/h", implied, waterMaxTbr))
+        }
+        let total = implied * Double(minutes) / 60.0
+        if sessionUnits + total > sessionMaxUnits {
+            return Result(ok: false, msg: String(format: "换算后一小时内累计将达 %.2fU，超过会话上限 %.0fU", sessionUnits + total, sessionMaxUnits))
+        }
+        if let rem = remaining, total > rem {
+            return Result(ok: false, msg: String(format: "本次共需 %.2fU，超过剩余药量 %.2fU", total, rem))
+        }
+        return Result(ok: true, msg: String(format: "临时基础率 %d%% ≈ %.2fU/h × %dmin 通过本地校验", p, implied, minutes))
     }
 }

@@ -83,5 +83,26 @@ var threwMin = false
 do { _ = try Params.TempBasal(rateUPerHour: 0.5, percent: nil, minutes: 0).bytes() } catch { threwMin = true }
 check("时长 0 分钟抛错", threwMin)
 
+// 百分比 TBR：没有基础率、换算超 3U/h、水测试上限
+var g1 = Guard.checkTbr(rate: nil, percent: 100, minutes: 60, remaining: 50,
+                        switchOn: true, sessionUnits: 0, waterTest: false, basalRate: nil)
+check("百分比无基础率拒绝", !g1.ok, g1.msg)
+
+var g2 = Guard.checkTbr(rate: nil, percent: 200, minutes: 60, remaining: 50,
+                        switchOn: true, sessionUnits: 0, waterTest: false, basalRate: 3.0)
+check("200%×3U/h=6U/h 拒绝", !g2.ok, g2.msg)
+
+var g3 = Guard.checkTbr(rate: nil, percent: 100, minutes: 60, remaining: 50,
+                        switchOn: true, sessionUnits: 0, waterTest: false, basalRate: 0.96)
+check("100%×0.96U/h 放行", g3.ok, g3.msg)
+
+var g4 = Guard.checkTbr(rate: nil, percent: 150, minutes: 60, remaining: 50,
+                        switchOn: true, sessionUnits: 0, waterTest: true, basalRate: 0.5)
+check("水测试 150%×0.5=0.75U/h 放行", g4.ok, g4.msg)
+
+var g5 = Guard.checkTbr(rate: nil, percent: 200, minutes: 240, remaining: 50,
+                        switchOn: true, sessionUnits: 12, waterTest: false, basalRate: 1.0)
+check("换算后超 15U/h 预算拒绝", !g5.ok, g5.msg)
+
 print(failed == 0 ? "ALL PASS" : "\(failed) FAILED")
 exit(failed == 0 ? 0 : 1)

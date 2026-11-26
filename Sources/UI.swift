@@ -85,6 +85,12 @@ struct ContentView: View {
                             Text(pump.remainingU.map { String(format: "%.2f U", $0) } ?? "—")
                         }
                         HStack {
+                            Text("当前基础率")
+                            Spacer()
+                            Text(pump.basalRateNow.map { String(format: "%.2f U/h", $0) } ?? "—")
+                                .foregroundColor(pump.basalRateNow == nil ? .secondary : .primary)
+                        }
+                        HStack {
                             Text("1 小时写入累计")
                             Spacer()
                             Text(String(format: "%.2f U", pump.sessionTotal()))
@@ -106,7 +112,11 @@ struct ContentView: View {
                             Text(pump.modelInfo).font(.caption2).foregroundColor(.secondary)
                         }
                         Button("刷新状态（0x00F0）") { pump.refreshStatus() }
+                        Button("读基础率（0x00F2）") { pump.readBasalPlan() }
                         Button("读版本（0x00E9）") { pump.readModel() }
+                        if pump.basalRateNow == nil {
+                            Text(pump.basalText).font(.caption2).foregroundColor(.secondary)
+                        }
                     }
 
                     Section(header: Text("工程模式 · 输注写入")) {
@@ -318,11 +328,17 @@ struct InfusionSheet: View {
             summary = String(format: "临时基础率 %.2f U/h × %d min", rate, minutes)
         default:
             guard let p = Int(percent.trimmingCharacters(in: .whitespaces)) else { errorText = "百分比必须是整数"; return }
+            guard let basal = pump.basalRateNow else {
+                errorText = "百分比模式要先读基础率：先点「读基础率（0x00F2）」，读到当前时段基础率再用百分比；或改用速率模式"
+                return
+            }
             let r = Guard.checkTbr(rate: nil, percent: p, minutes: minutes,
                                    remaining: pump.remainingU, switchOn: pump.switchOn,
-                                   sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
+                                   sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest,
+                                   basalRate: basal)
             guard r.ok else { errorText = r.msg; return }
-            summary = "临时基础率 \(p)% × \(minutes) min"
+            let implied = basal * Double(p) / 100
+            summary = String(format: "临时基础率 %d%% ≈ %.2f U/h（按当前基础率 %.2f）× %d min", p, implied, basal, minutes)
         }
         showConfirm = true
     }
