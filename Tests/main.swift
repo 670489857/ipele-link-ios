@@ -56,18 +56,19 @@ let sample = Proto.build(cmd: 0x00F0, data: [], seq: 3, padded: true)
 let asm1 = FrameAssembler()
 let a1 = asm1.feed([sample[0]])
 let a2 = asm1.feed(Array(sample[1...]))
-check("单字节 0x55 保留", a1.isEmpty && a2.count == 1 && a2[0].cmd == 0x80F0, "frames=\(a2.count)")
+check("单字节 0x55 保留", a1.isEmpty && a2.count == 1 && a2[0].cmd == 0x00F0, "frames=\(a2.count)")
 
 let asm2 = FrameAssembler()
 let b1 = asm2.feed(Array(sample[0..<3]))
 let b2 = asm2.feed(Array(sample[3...]))
 check("帧跨 3 段重组", b1.isEmpty && b2.count == 1)
 
+// 帧与帧之间的垃圾字节要被丢掉，不能污染下一帧
 let asm3 = FrameAssembler()
-let c1 = asm3.feed(Array(sample[0..<2]))
+let c1 = asm3.feed(sample)
 let junk = asm3.feed([0x12, 0x34])
-let c2 = asm3.feed(Array(sample[2...]))
-check("垃圾字节后仍能恢复", c1.count + c2.count == 1 && junk.isEmpty)
+let c2 = asm3.feed(sample)
+check("帧间垃圾后能恢复", c1.count == 1 && c2.count == 1 && junk.isEmpty)
 
 // 参数越界必须抛错，不能静默截断后下发
 var threwRate = false
