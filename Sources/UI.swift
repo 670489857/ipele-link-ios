@@ -16,15 +16,20 @@ struct ContentView: View {
         NavigationView {
             List {
                 Section {
-                    if let hero = HeroImage.image {
-                        Image(uiImage: hero)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(maxHeight: 132)
-                            .frame(maxWidth: .infinity)
-                            .listRowInsets(EdgeInsets(top: 14, leading: 0, bottom: 14, trailing: 0))
-                            .listRowBackground(Color.clear)
+                    VStack(spacing: 8) {
+                        if let hero = HeroImage.image {
+                            Image(uiImage: hero)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxHeight: 132)
+                                .frame(maxWidth: .infinity)
+                        }
+                        Text(AppInfo.versionText)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                     }
+                    .listRowInsets(EdgeInsets(top: 14, leading: 0, bottom: 10, trailing: 0))
+                    .listRowBackground(Color.clear)
                 }
 
                 Section(header: Text("连接")) {
@@ -205,6 +210,13 @@ struct SettingsView: View {
                         sn = draftSn.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
                         pump.configure(sn: sn, paddedEmpty: paddedEmpty)
                         dismiss()
+                    }
+                }
+                Section(header: Text("关于"), footer: Text("IpeleLink for iOS · \(AppInfo.versionText)（未签名自签构建）")) {
+                    HStack {
+                        Text("通信协议")
+                        Spacer()
+                        Text("Ipele / Elfin 2.0 · 55AA 帧").font(.caption).foregroundColor(.secondary)
                     }
                 }
             }
@@ -409,5 +421,13 @@ struct LogView: View {
         case "OK": return .green
         default: return .secondary
         }
+    }
+}
+
+enum AppInfo {
+    static var versionText: String {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "v\(v) · build \(b)"
     }
 }
