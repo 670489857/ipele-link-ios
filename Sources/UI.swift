@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @ObservedObject var pump: PumpClient
@@ -15,13 +16,15 @@ struct ContentView: View {
         NavigationView {
             List {
                 Section {
-                    Image("PumpHero")
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxHeight: 132)
-                        .frame(maxWidth: .infinity)
-                        .listRowInsets(EdgeInsets(top: 14, leading: 0, bottom: 14, trailing: 0))
-                        .listRowBackground(Color.clear)
+                    if let hero = UIImage(named: "PumpHero") {
+                        Image(uiImage: hero)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxHeight: 132)
+                            .frame(maxWidth: .infinity)
+                            .listRowInsets(EdgeInsets(top: 14, leading: 0, bottom: 14, trailing: 0))
+                            .listRowBackground(Color.clear)
+                    }
                 }
 
                 Section(header: Text("连接")) {
