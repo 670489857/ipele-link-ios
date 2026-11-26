@@ -15,7 +15,13 @@
     <key>LSRequiresIPhoneOS</key><true/>
     <key>MinimumOSVersion</key><string>15.0</string>
     <key>UIDeviceFamily</key><array><integer>1</integer></array>
-    <key>UILaunchScreen</key><dict/>
+    <key>UILaunchScreen</key><dict><key>UIImageName</key><string>LaunchPump</string></dict>
+    <key>CFBundleIcons</key><dict>
+        <key>CFBundlePrimaryIcon</key><dict>
+            <key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array>
+            <key>CFBundleIconName</key><string>AppIcon</string>
+        </dict>
+    </dict>
     <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
     <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>bluetooth-le</string></array>
     <key>UIBackgroundModes</key><array><string>bluetooth-central</string></array>

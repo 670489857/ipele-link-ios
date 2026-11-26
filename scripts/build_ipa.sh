@@ -20,6 +20,8 @@ xcrun --sdk iphoneos swiftc \
   -o "$OUT/Payload/$APP_NAME.app/$APP_NAME"
 
 cp Resources/Info.plist "$OUT/Payload/$APP_NAME.app/Info.plist"
+# 图标 / 启动图 / 首页主图：同一张抠图，透明层叠在系统背景上
+cp Resources/Bundle/*.png "$OUT/Payload/$APP_NAME.app/"
 printf 'APPL????' > "$OUT/Payload/$APP_NAME.app/PkgInfo"
 
 # ad-hoc 签名（真机安装前仍需 Sideloadly/AltStore/TrollStore 用你的证书重签）

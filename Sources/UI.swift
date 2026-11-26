@@ -14,6 +14,16 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             List {
+                Section {
+                    Image("PumpHero")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxHeight: 132)
+                        .frame(maxWidth: .infinity)
+                        .listRowInsets(EdgeInsets(top: 14, leading: 0, bottom: 14, trailing: 0))
+                        .listRowBackground(Color.clear)
+                }
+
                 Section(header: Text("连接")) {
                     HStack {
                         Text("蓝牙")
