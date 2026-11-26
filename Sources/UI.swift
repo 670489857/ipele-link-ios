@@ -16,7 +16,7 @@ struct ContentView: View {
         NavigationView {
             List {
                 Section {
-                    if let hero = UIImage(named: "PumpHero") {
+                    if let hero = HeroImage.image {
                         Image(uiImage: hero)
                             .resizable()
                             .scaledToFit()
