@@ -225,7 +225,7 @@ struct ContentView: View {
     private var deviceCard: some View {
         VStack(spacing: 0) {
             sectionTitle("设备")
-            infoCell("泵名称", "艾派乐 Elfin 2.0")
+            infoCell("泵名称", "艾派乐泵")
             divider
             infoCell("序列号", serialNumber)
             divider
