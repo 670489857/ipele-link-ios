@@ -681,7 +681,10 @@ final class PumpClient: NSObject, ObservableObject {
                                sessionUnits: sessionTotal(), waterTest: waterTest,
                                basalRate: basalRateNow)
         guard g.ok else {
-            log("GUARD", "拒绝临时基础率 \(rate.map { String(format: "%.2fU/h", $0) } ?? "百分比 \(percent.map(String.init) ?? "?")%"）：\(g.msg)")
+            let what: String
+            if let r = rate { what = String(format: "%.2fU/h", r) }
+            else { what = "百分比" + String(percent ?? 0) + "%" }
+            log("GUARD", "拒绝临时基础率 \(what)：\(g.msg)")
             return g
         }
         do {
