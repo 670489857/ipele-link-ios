@@ -54,6 +54,8 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var verifyText = ""
     @Published var basalRateNow: Double? = nil
     @Published var basalText = "未读取"
+    @Published var pumpHour: Int? = nil
+    @Published var pumpTimeText = "—"
     @Published var lastExchange: LastExchange? = nil
     @Published var lastNotifyRaw = ""
 
@@ -133,7 +135,11 @@ final class PumpClient: NSObject, ObservableObject {
     /// 泵的蓝牙名形如 EV1251007021；SN 末 8 位就是名字末尾 8 个十六进制字符。
     static func isPumpName(_ name: String) -> Bool {
         let t = name.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        return t.hasPrefix("EV") || t.hasPrefix("EI")
+        // 目前见过的艾派乐泵名：EV（这台 EV1251007021）、EL（Elfin）、EI。
+        guard ["EV", "EL", "EI"].contains(String(t.prefix(2))) else { return false }
+        let rest = t.dropFirst(2)
+        // 泵名是前缀 + 一串数字/十六进制 SN，避免把 “EIGHT” 这类名字放进来。
+        return rest.count >= 8 && rest.allSatisfy { $0.isHexDigit }
     }
 
     static func snFromPumpName(_ name: String) -> String? {
@@ -165,7 +171,7 @@ final class PumpClient: NSObject, ObservableObject {
             central?.scanForPeripherals(withServices: nil,
                                         options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         }
-        log("SYS", "开始扫描：只显示 EV / EI 开头的泵，选中后自动识别 SN 末 8 位")
+        log("SYS", "开始扫描：只显示 EV / EL / EI 开头的泵，选中后自动识别 SN 末 8 位")
     }
 
     func stopScan() {
@@ -190,6 +196,11 @@ final class PumpClient: NSObject, ObservableObject {
         if let p = peripheral { central?.cancelPeripheralConnection(p) }
         basalRateNow = nil
         basalText = "未读取"
+        pumpHour = nil
+        pumpTimeText = "—"
+        timeResolving = false
+        timeFailed = false
+        pumpTimeAt = nil
         cleanup(reason: "主动断开")
     }
 
@@ -619,6 +630,31 @@ final class PumpClient: NSObject, ObservableObject {
 
     // ------------------------------------------------------------ 便捷动作
 
+    /// 读泵当前时间（0x00E7，13B：年 月 日 时 分 秒…）。
+    /// 基础率点表按泵自己的时钟走，不能拿手机时间直接查。
+    private var timeResolving = false
+    private var timeFailed = false
+    private var pumpTimeAt: Date? = nil
+
+    func readPumpTime(completion: ((Bool) -> Void)? = nil) {
+        runCommand(Cmd.GET_SYSTEM_SETTINGS_INFORMATION) { [weak self] p in
+            guard let self = self else { return }
+            guard let p = p, let h = p.int("hour"), (0...23).contains(h) else {
+                self.pumpHour = nil
+                self.pumpTimeText = "读取失败"
+                self.log("ERR", "泵时间读取失败，基础率将退回按手机时间选段")
+                completion?(false)
+                return
+            }
+            let m = p.int("minute") ?? 0
+            self.pumpHour = h
+            self.pumpTimeAt = Date()
+            self.pumpTimeText = String(format: "%02d:%02d", h, m)
+            self.log("OK", "泵时间 \(self.pumpTimeText)")
+            completion?(true)
+        }
+    }
+
     /// 读基础量方案（0x00F2），取当前小时的基础率。
     /// 百分比 TBR 必须先有它，否则算不出绝对剂量。
     ///
@@ -629,6 +665,18 @@ final class PumpClient: NSObject, ObservableObject {
     func readBasalPlan() {
         guard connected else {
             basalText = "未连接"
+            return
+        }
+        // 先拿泵时间；拿不到就退回手机时间。失败后本次连接内不再反复重试。
+        let timeStale = pumpTimeAt.map { Date().timeIntervalSince($0) > 300 } ?? true
+        if timeStale && !timeResolving && !timeFailed {
+            timeResolving = true
+            readPumpTime { [weak self] ok in
+                guard let self = self else { return }
+                self.timeResolving = false
+                if !ok { self.timeFailed = true }
+                self.readBasalPlan()
+            }
             return
         }
         basalAccum = [:]
@@ -671,15 +719,22 @@ final class PumpClient: NSObject, ObservableObject {
             basalRateNow = nil
             return
         }
-        let hour = Calendar.current.component(.hour, from: Date())
+        let pumpTimeKnown = pumpHour != nil
+        let hour = pumpHour ?? Calendar.current.component(.hour, from: Date())
         let rate = rateForHour(hour, basalAccum)
         basalRateNow = rate
         if let r = rate {
-            basalText = String(format: "%02d:00 起 %.2f U/h（%d 个时段）", hourKey(hour, basalAccum), r, basalAccum.count)
+            let source = pumpTimeKnown ? "泵时间 \(pumpTimeText)" : "手机时间（泵时间未读到）"
+            basalText = String(format: "%02d:00 起 %.2f U/h（%d 个时段，%@）", hourKey(hour, basalAccum), r, basalAccum.count, source)
         } else {
             basalText = "点表为空"
         }
         log("OK", "基础率 \(basalText)")
+        // 基础率读完后顺手刷一次剩余药量/开关，首页不再显示 “—”。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self = self, self.connected else { return }
+            self.refreshStatus()
+        }
     }
 
     /// 一键采集：把排查大剂量失败最需要的 5 条读取串起来跑，日志里会有完整收发。
@@ -961,7 +1016,7 @@ extension PumpClient: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "未命名设备"
-        // 定向只显示 EV / EI 开头的艾派乐泵，避免一堆 Mesh/灯泡/车机刷屏。
+        // 定向只显示 EV / EL / EI 开头的艾派乐泵，避免一堆 Mesh/灯泡/车机刷屏。
         guard PumpClient.isPumpName(name) else { return }
         let r = RSSI.intValue
         if let i = devices.firstIndex(where: { $0.id == peripheral.identifier }) {

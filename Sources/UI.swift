@@ -68,7 +68,7 @@ struct ContentView: View {
                 }
 
                 if !pump.connected && !pump.devices.isEmpty {
-                    Section(header: Text("发现的泵（EV/EI，\(pump.devices.count)）")) {
+                    Section(header: Text("发现的泵（EV/EL/EI，\(pump.devices.count)）")) {
                         ForEach(pump.devices.sorted { $0.rssi > $1.rssi }) { d in
                             Button {
                                 pump.connect(d)
@@ -95,6 +95,11 @@ struct ContentView: View {
                             Spacer()
                             Text(pump.basalRateNow.map { String(format: "%.2f U/h", $0) } ?? "—")
                                 .foregroundColor(pump.basalRateNow == nil ? .secondary : .primary)
+                        }
+                        HStack {
+                            Text("泵时间")
+                            Spacer()
+                            Text(pump.pumpTimeText).font(.caption).foregroundColor(.secondary)
                         }
                         HStack {
                             Text("1 小时写入累计")
