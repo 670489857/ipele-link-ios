@@ -130,6 +130,29 @@ final class PumpClient: NSObject, ObservableObject {
 
     var encrypted: Bool { key != nil }
 
+    /// 泵的蓝牙名形如 EV1251007021；SN 末 8 位就是名字末尾 8 个十六进制字符。
+    static func isPumpName(_ name: String) -> Bool {
+        let t = name.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        return t.hasPrefix("EV") || t.hasPrefix("EI")
+    }
+
+    static func snFromPumpName(_ name: String) -> String? {
+        let t = name.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard isPumpName(t) else { return nil }
+        let tail = String(t.suffix(8))
+        guard tail.count == 8, tail.allSatisfy({ $0.isHexDigit }) else { return nil }
+        return tail
+    }
+
+    /// 连上 EV/EI 泵时自动把设备名末 8 位填成 SN，并立即启用加密。
+    private func adoptSN(from name: String) {
+        guard let s = PumpClient.snFromPumpName(name) else { return }
+        guard s != sn else { return }
+        UserDefaults.standard.set(s, forKey: "ipele.sn")
+        configure(sn: s, paddedEmpty: paddedEmpty)
+        log("SYS", "已从设备名 \(name) 自动填入 SN 末 8 位 \(s)，加密已启用")
+    }
+
     // ------------------------------------------------------------ 扫描 / 连接
 
     func startScan() {
@@ -142,7 +165,7 @@ final class PumpClient: NSObject, ObservableObject {
             central?.scanForPeripherals(withServices: nil,
                                         options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         }
-        log("SYS", "开始扫描（不过滤 Service UUID，请从列表里选泵）")
+        log("SYS", "开始扫描：只显示 EV / EI 开头的泵，选中后自动识别 SN 末 8 位")
     }
 
     func stopScan() {
@@ -155,6 +178,7 @@ final class PumpClient: NSObject, ObservableObject {
         stopScan()
         connecting = true
         currentName = d.name
+        adoptSN(from: d.name)
         peripheral = d.peripheral
         d.peripheral.delegate = self
         c.connect(d.peripheral, options: nil)
@@ -585,6 +609,7 @@ final class PumpClient: NSObject, ObservableObject {
         }
         connecting = true
         currentName = p.name ?? "上次的设备"
+        adoptSN(from: currentName)
         peripheral = p
         p.delegate = self
         c.connect(p, options: nil)
@@ -936,6 +961,8 @@ extension PumpClient: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "未命名设备"
+        // 定向只显示 EV / EI 开头的艾派乐泵，避免一堆 Mesh/灯泡/车机刷屏。
+        guard PumpClient.isPumpName(name) else { return }
         let r = RSSI.intValue
         if let i = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
             devices[i] = DiscoveredDevice(id: peripheral.identifier, name: name, rssi: r, peripheral: peripheral)

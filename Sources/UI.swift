@@ -61,8 +61,14 @@ struct ContentView: View {
                     }
                 }
 
+                if pump.scanning && pump.devices.isEmpty {
+                    Section {
+                        Text("正在查找 EV 开头的泵…").font(.caption).foregroundColor(.secondary)
+                    }
+                }
+
                 if !pump.connected && !pump.devices.isEmpty {
-                    Section(header: Text("发现的设备（\(pump.devices.count)）")) {
+                    Section(header: Text("发现的泵（EV/EI，\(pump.devices.count)）")) {
                         ForEach(pump.devices.sorted { $0.rssi > $1.rssi }) { d in
                             Button {
                                 pump.connect(d)
@@ -225,7 +231,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("泵序列号"), footer: Text("填序列号后 8 位（十六进制 0-9/A-F）。留空则按明文收发，泵一般会拒绝。")) {
+                Section(header: Text("泵序列号"), footer: Text("一般不用手填：扫描到 EV 开头的泵并连接后，会自动取设备名末 8 位填入。也可手动改。留空则按明文收发。")) {
                     TextField("例如 E5F60718", text: $draftSn)
                         .autocapitalization(.allCharacters)
                         .disableAutocorrection(true)
