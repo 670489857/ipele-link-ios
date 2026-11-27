@@ -267,6 +267,7 @@ struct InfusionSheet: View {
     @State private var amount = ""
     @State private var duration = "60"
     @State private var percent = "100"
+    @State private var waveform = 0
     @State private var showConfirm = false
     @State private var summary = ""
     @State private var errorText = ""
@@ -289,6 +290,11 @@ struct InfusionSheet: View {
                     if mode == 0 {
                         HStack { Text("剂量 (U)"); TextField("0.10", text: $amount).keyboardType(.decimalPad) }
                         HStack { Text("时长 (min，0=即刻)"); TextField("0", text: $duration).keyboardType(.numberPad) }
+                        Picker("波形", selection: $waveform) {
+                            Text("自动").tag(0)
+                            Text("3").tag(3)
+                            Text("4").tag(4)
+                        }.pickerStyle(.segmented)
                     } else if mode == 1 {
                         HStack { Text("速率 (U/h)"); TextField("0.50", text: $amount).keyboardType(.decimalPad) }
                         HStack { Text("时长 (min)"); TextField("60", text: $duration).keyboardType(.numberPad) }
@@ -331,7 +337,8 @@ struct InfusionSheet: View {
             let r = Guard.checkBolus(units: u, remaining: pump.remainingU, switchOn: pump.switchOn,
                                      sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
-            summary = "大剂量 \(String(format: "%.2f", u)) U" + (minutes > 0 ? "，波形时长 \(minutes) min" : "")
+            let waveText = waveform == 0 ? "自动" : "波形 \(waveform)"
+            summary = "大剂量 \(String(format: "%.2f", u)) U，\(waveText)" + (minutes > 0 ? "，时长 \(minutes) min" : "")
         case 1:
             guard let rate = Guard.parseUnits(amount) else { errorText = "速率必须是大于 0 的数字"; return }
             let r = Guard.checkTbr(rate: rate, percent: nil, minutes: minutes,
@@ -361,7 +368,8 @@ struct InfusionSheet: View {
         switch mode {
         case 0:
             if let u = Guard.parseUnits(amount) {
-                let r = pump.sendBolus(units: u, minutes: minutes)
+                let r = pump.sendBolus(units: u, minutes: minutes,
+                                       waveform: waveform == 0 ? nil : waveform)
                 errorText = r.ok ? "" : r.msg
             }
         case 1:
