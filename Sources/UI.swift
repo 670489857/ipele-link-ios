@@ -93,8 +93,18 @@ struct ContentView: View {
                         HStack {
                             Text("当前基础率")
                             Spacer()
-                            Text(pump.basalRateNow.map { String(format: "%.2f U/h", $0) } ?? "—")
+                            Text((pump.basalDisplayRate ?? pump.basalRateNow).map { String(format: "%.2f U/h", $0) } ?? "—")
                                 .foregroundColor(pump.basalRateNow == nil ? .secondary : .primary)
+                        }
+                        HStack {
+                            Text("基础率方案")
+                            Spacer()
+                            Text(pump.basalText).font(.caption2).foregroundColor(.secondary)
+                        }
+                        HStack {
+                            Text("临时基础率")
+                            Spacer()
+                            Text(pump.tempBasalText).font(.caption2).foregroundColor(.secondary)
                         }
                         HStack {
                             Text("泵时间")
@@ -118,7 +128,12 @@ struct ContentView: View {
                             Text(pump.lastAck).font(.caption).foregroundColor(.secondary)
                         }
                         HStack {
-                            Text("版本")
+                            Text("泵版本")
+                            Spacer()
+                            Text(pump.pumpVersionText).font(.caption).foregroundColor(.secondary)
+                        }
+                        HStack {
+                            Text("通信协议")
                             Spacer()
                             Text(pump.modelInfo).font(.caption2).foregroundColor(.secondary)
                         }

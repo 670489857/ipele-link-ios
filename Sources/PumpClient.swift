@@ -53,8 +53,12 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var selfCheckText = ""
     @Published var verifyText = ""
     @Published var basalRateNow: Double? = nil
+    @Published var basalDisplayRate: Double? = nil
     @Published var basalText = "未读取"
+    @Published var tempBasalText = "—"
+    @Published var pumpVersionText = "—"
     @Published var pumpHour: Int? = nil
+    @Published var pumpMinute: Int? = nil
     @Published var pumpTimeText = "—"
     @Published var lastExchange: LastExchange? = nil
     @Published var lastNotifyRaw = ""
@@ -80,6 +84,9 @@ final class PumpClient: NSObject, ObservableObject {
     private var doses: [DoseEntry] = []
     private let doseKey = "ipele.doses"
     private let lastDeviceKey = "ipele.lastPeripheral"
+    private let lastNameKey = "ipele.lastPeripheralName"
+    private var didAutoReconnect = false
+    private var pendingAutoConnectName: String? = nil
     private var connectTimer: DispatchWorkItem?
 
     // 超时计时改为「最后一包写完后」才开始；这之前用写通道看门狗兜底
@@ -105,6 +112,12 @@ final class PumpClient: NSObject, ObservableObject {
             doses = list
         }
         pruneDoses()
+        // 启动时就创建 CBCentralManager，App 被划掉重开后可用系统缓存 UUID 自动重连。
+        central = CBCentralManager(delegate: nil, queue: nil)
+        central?.delegate = self
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.autoReconnectLastIfNeeded()
+        }
     }
 
     // ------------------------------------------------------------ 配置
@@ -195,8 +208,12 @@ final class PumpClient: NSObject, ObservableObject {
     func disconnect() {
         if let p = peripheral { central?.cancelPeripheralConnection(p) }
         basalRateNow = nil
+        basalDisplayRate = nil
         basalText = "未读取"
+        tempBasalText = "—"
+        pumpVersionText = "—"
         pumpHour = nil
+        pumpMinute = nil
         pumpTimeText = "—"
         timeResolving = false
         timeFailed = false
@@ -221,6 +238,7 @@ final class PumpClient: NSObject, ObservableObject {
         connectTimer = nil
         connected = false
         connecting = false
+        basalDisplayRate = nil
         writeChar = nil
         notifyChar = nil
         assembler.reset()
@@ -648,6 +666,7 @@ final class PumpClient: NSObject, ObservableObject {
             }
             let m = p.int("minute") ?? 0
             self.pumpHour = h
+            self.pumpMinute = m
             self.pumpTimeAt = Date()
             self.pumpTimeText = String(format: "%02d:%02d", h, m)
             self.log("OK", "泵时间 \(self.pumpTimeText)")
@@ -685,7 +704,8 @@ final class PumpClient: NSObject, ObservableObject {
     }
 
     private func requestBasalSegment(from s: Int) {
-        let lastPoint = 0x17
+        // 厂商 BasicQuantityPlanParameter(0, 0, 47)：点表是 48 个半小时点，不是 24 个小时点。
+        let lastPoint = 0x2F
         guard s <= lastPoint else { finishBasal(); return }
         // 厂商 BasicQuantityPlanParameter.toByteArray() 是 3B：[mode][startTimePoint][endTimePoint]
         runCommand(Cmd.GET_BASIC_QUANTITY_PLAN, payload: [0x00, UInt8(s), UInt8(lastPoint)]) { [weak self] p in
@@ -721,19 +741,102 @@ final class PumpClient: NSObject, ObservableObject {
         }
         let pumpTimeKnown = pumpHour != nil
         let hour = pumpHour ?? Calendar.current.component(.hour, from: Date())
-        let rate = rateForHour(hour, basalAccum)
+        let minute = pumpMinute ?? Calendar.current.component(.minute, from: Date())
+        // 48 个半小时点：11:39 -> slot 23；11:00 -> slot 22。
+        let slot = slotForTime(hour, minute)
+        let rate = rateForSlot(slot, basalAccum)
         basalRateNow = rate
+        basalDisplayRate = rate
         if let r = rate {
             let source = pumpTimeKnown ? "泵时间 \(pumpTimeText)" : "手机时间（泵时间未读到）"
-            basalText = String(format: "%02d:00 起 %.2f U/h（%d 个时段，%@）", hourKey(hour, basalAccum), r, basalAccum.count, source)
+            let key = slotKey(slot, basalAccum)
+            basalText = String(format: "%@ 起 %.2f U/h（48 半小时点·%d 段，%@）", slotLabel(key), r, basalAccum.count, source)
         } else {
             basalText = "点表为空"
         }
         log("OK", "基础率 \(basalText)")
-        // 基础率读完后顺手刷一次剩余药量/开关，首页不再显示 “—”。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self = self, self.connected else { return }
-            self.refreshStatus()
+        readTempBasal { [weak self] in
+            self?.readPumpVersion { [weak self] _ in
+                self?.refreshStatus()
+            }
+        }
+    }
+
+    private func slotForTime(_ hour: Int, _ minute: Int) -> Int {
+        return hour * 2 + (minute >= 30 ? 1 : 0)
+    }
+
+    private func rateForSlot(_ slot: Int, _ map: [Int: Double]) -> Double? {
+        if let v = map[slot] { return v }
+        let lower = map.keys.filter { $0 <= slot }.max()
+        if let k = lower { return map[k] }
+        return map.keys.min().flatMap { map[$0] }
+    }
+
+    private func slotKey(_ slot: Int, _ map: [Int: Double]) -> Int {
+        if map[slot] != nil { return slot }
+        return map.keys.filter { $0 <= slot }.max() ?? (map.keys.min() ?? 0)
+    }
+
+    private func slotLabel(_ slot: Int) -> String {
+        String(format: "%02d:%02d", slot / 2, (slot % 2) * 30)
+    }
+
+    /// 读临时基础率（0x00F3）。泵上显示的“当前基础率”若是 0.1 而方案是 0.15，
+    /// 很可能是正在跑的 TBR，必须把这一项单独显示出来。
+    private func readTempBasal(completion: (() -> Void)? = nil) {
+        runCommand(Cmd.GET_TEMPORARY_BASIC_QUANTITY_PLAN) { [weak self] p in
+            guard let self = self else { completion?(); return }
+            defer { completion?() }
+            guard let p = p else { self.tempBasalText = "读取失败"; return }
+            let speed = p.dbl("speed")
+            let duration = p.int("duration")
+            let pct = p.int("percentage") ?? 0
+            let sw = p.int("percentage_switch") ?? 0
+            if sw != 0 && (duration ?? 0) > 0 {
+                let plan = self.basalRateNow ?? 0
+                let actual = pct > 0 ? plan * Double(pct) / 100.0 : (speed ?? 0)
+                self.basalDisplayRate = actual
+                self.tempBasalText = String(format: "运行中 %.2f U/h，剩 %d 分钟（%d%%）", actual, duration ?? 0, pct)
+                self.log("OK", "临时基础率 \(self.tempBasalText)，方案 \(String(format: "%.2f", plan)) U/h")
+            } else {
+                self.tempBasalText = "无"
+                self.basalDisplayRate = self.basalRateNow
+                self.log("OK", "临时基础率 无")
+            }
+        }
+    }
+
+    /// 读泵版本（0x00E8 工厂模式数据）。泵屏幕显示的是 V1 / V1.1.6；
+    /// 0x00E9 只是“通信协议版本”0.0.2，不能用它冒充泵软件版本。
+    func readPumpVersion(completion: ((Bool) -> Void)? = nil) {
+        runCommand(Cmd.GET_FACTORY_MODE_DATA) { [weak self] p in
+            guard let self = self else { completion?(false); return }
+            guard let p = p else {
+                self.pumpVersionText = "读取失败"
+                completion?(false)
+                return
+            }
+            let hw = p.int("hardware_version_number") ?? 0
+            let m1 = p.int("master_version1") ?? 0
+            let m2 = p.int("master_version2") ?? 0
+            let m3 = p.int("master_version3") ?? 0
+            let m4 = p.str("master_version4") ?? "0"
+            var master = [m1, m2, m3]
+            if let build = Int(m4, radix: 16), build != 0 { master.append(build) }
+            while master.count > 1 && master.last == 0 { master.removeLast() }
+            let masterText = master.map { String($0) }.joined(separator: ".")
+            let s1 = p.int("slave_version1") ?? 0
+            let s2 = p.int("slave_version2") ?? 0
+            let s3 = p.int("slave_version3") ?? 0
+            let s4 = p.str("slave_version4") ?? "0"
+            var slave = [s1, s2, s3]
+            if let build = Int(s4, radix: 16), build != 0 { slave.append(build) }
+            while slave.count > 1 && slave.last == 0 { slave.removeLast() }
+            let slaveText = slave.map { String($0) }.joined(separator: ".")
+            self.pumpVersionText = "V\(hw) / V\(masterText)"
+            self.log("OK", "泵版本 \(self.pumpVersionText)（从 V\(slaveText)，工厂数据 \(p.summary)）")
+            completion?(true)
         }
     }
 
@@ -746,8 +849,10 @@ final class PumpClient: NSObject, ObservableObject {
         let steps: [(Int, [UInt8])] = [
             (Cmd.GET_REMAINMED_AND_ISWITCH, []),
             (Cmd.GET_VERSION, []),
+            (Cmd.GET_FACTORY_MODE_DATA, []),
+            (Cmd.GET_TEMPORARY_BASIC_QUANTITY_PLAN, []),
             (Cmd.GET_PARAMETER_SETTINGS, []),
-            (Cmd.GET_BASIC_QUANTITY_PLAN, [0x00, 0x00, 0x17]),
+            (Cmd.GET_BASIC_QUANTITY_PLAN, [0x00, 0x00, 0x2F]),
             (Cmd.GET_ALL_INFUSION_SETTING_INFORMATION, [])
         ]
         log("SYS", "开始一键采集诊断，共 \(steps.count) 条读取")
@@ -765,17 +870,6 @@ final class PumpClient: NSObject, ObservableObject {
         next(0)
     }
 
-    private func rateForHour(_ h: Int, _ map: [Int: Double]) -> Double? {
-        if let v = map[h] { return v }
-        let lower = map.keys.filter { $0 <= h }.max()
-        if let k = lower { return map[k] }
-        return map.keys.min().flatMap { map[$0] }
-    }
-
-    private func hourKey(_ h: Int, _ map: [Int: Double]) -> Int {
-        if map[h] != nil { return h }
-        return map.keys.filter { $0 <= h }.max() ?? (map.keys.min() ?? 0)
-    }
 
     func refreshStatus() {
         busy = true
@@ -992,6 +1086,38 @@ final class PumpClient: NSObject, ObservableObject {
 
 extension PumpClient: CBCentralManagerDelegate {
 
+    /// App 被划掉后重新进来：先从系统缓存按 UUID 找回上次的泵并直接连接；
+    /// 缓存里没有（蓝牙重启/系统清缓存）就自动扫描同名设备并连上。
+    private func autoReconnectLastIfNeeded() {
+        guard let c = central, c.state == .poweredOn,
+              !didAutoReconnect, !connected, !connecting else { return }
+        didAutoReconnect = true
+        guard let s = UserDefaults.standard.string(forKey: lastDeviceKey),
+              let uuid = UUID(uuidString: s) else {
+            log("SYS", "没有上次的泵记录，请点扫描连接")
+            return
+        }
+        let savedName = UserDefaults.standard.string(forKey: lastNameKey)
+        if let p = c.retrievePeripherals(withIdentifiers: [uuid]).first {
+            connecting = true
+            currentName = p.name ?? savedName ?? "上次的泵"
+            adoptSN(from: currentName)
+            peripheral = p
+            p.delegate = self
+            c.connect(p, options: nil)
+            startConnectTimer()
+            log("SYS", "启动自动重连上次的泵 \(currentName)")
+            return
+        }
+        if let name = savedName, PumpClient.isPumpName(name) {
+            pendingAutoConnectName = name
+            log("SYS", "系统缓存里暂时没有 \(name)，自动扫描并连接")
+            startScan()
+        } else {
+            log("ERR", "找不到上次的泵，请手动扫描")
+        }
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
@@ -999,6 +1125,8 @@ extension PumpClient: CBCentralManagerDelegate {
             log("SYS", "蓝牙已就绪")
             if scanning {
                 central.scanForPeripherals(withServices: nil, options: nil)
+            } else {
+                autoReconnectLastIfNeeded()
             }
         case .poweredOff:
             bluetoothState = "蓝牙已关闭"
@@ -1018,6 +1146,13 @@ extension PumpClient: CBCentralManagerDelegate {
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "未命名设备"
         // 定向只显示 EV / EL / EI 开头的艾派乐泵，避免一堆 Mesh/灯泡/车机刷屏。
         guard PumpClient.isPumpName(name) else { return }
+        if let want = pendingAutoConnectName, name.uppercased() == want.uppercased(),
+           !connected && !connecting {
+            pendingAutoConnectName = nil
+            log("SYS", "扫描到上次的泵 \(name)，自动连接")
+            connect(DiscoveredDevice(id: peripheral.identifier, name: name, rssi: RSSI.intValue, peripheral: peripheral))
+            return
+        }
         let r = RSSI.intValue
         if let i = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
             devices[i] = DiscoveredDevice(id: peripheral.identifier, name: name, rssi: r, peripheral: peripheral)
@@ -1031,6 +1166,8 @@ extension PumpClient: CBCentralManagerDelegate {
         connectTimer?.cancel()
         connectTimer = nil
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastDeviceKey)
+        UserDefaults.standard.set(peripheral.name ?? currentName, forKey: lastNameKey)
+        pendingAutoConnectName = nil
         log("SYS", "已连接，发现服务 \(Proto.serviceUUID)")
         peripheral.delegate = self
         peripheral.discoverServices([CBUUID(string: Proto.serviceUUID)])
