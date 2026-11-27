@@ -168,7 +168,13 @@ enum L {
                           year, int(d["month"]) ?? 0, int(d["day"]) ?? 0,
                           int(d["hour"]) ?? 0, int(d["minute"]) ?? 0, int(d["second"]) ?? 0)
         let op = int(d["operation_id"]).map { " · 操作 \($0)" } ?? ""
-        return date + op
+        let skip: Set<String> = ["year", "month", "day", "hour", "minute", "second", "operation_id"]
+        var extras: [String] = []
+        for k in sortedKeys(Array(d.keys)) where !skip.contains(k) {
+            if let v = d[k] { extras.append("\(label(k)) \(valueText(v))") }
+        }
+        let tail = extras.isEmpty ? "" : " · " + extras.joined(separator: "，")
+        return date + op + tail
     }
 
     private static func int(_ v: Any?) -> Int? {
