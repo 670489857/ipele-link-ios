@@ -57,6 +57,9 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var basalText = "未读取"
     @Published var tempBasalText = "—"
     @Published var pumpVersionText = "—"
+    @Published var batteryPct: Int? = nil
+    @Published var todayTotalU: Double? = nil
+    @Published var lastSyncAt: Date? = nil
     @Published var pumpHour: Int? = nil
     @Published var pumpMinute: Int? = nil
     @Published var pumpTimeText = "—"
@@ -212,6 +215,9 @@ final class PumpClient: NSObject, ObservableObject {
         basalText = "未读取"
         tempBasalText = "—"
         pumpVersionText = "—"
+        batteryPct = nil
+        todayTotalU = nil
+        lastSyncAt = nil
         pumpHour = nil
         pumpMinute = nil
         pumpTimeText = "—"
@@ -665,6 +671,7 @@ final class PumpClient: NSObject, ObservableObject {
                 return
             }
             let m = p.int("minute") ?? 0
+            if let b = p.int("battery_percentage") { self.batteryPct = b }
             self.pumpHour = h
             self.pumpMinute = m
             self.pumpTimeAt = Date()
@@ -878,8 +885,51 @@ final class PumpClient: NSObject, ObservableObject {
             let p = Responses.decode(cmd: f.cmd, data: f.data)
             if let r = p.dbl("remaining_dosage") { self.remainingU = r }
             self.switchOn = p.int("infusion_switch").map { $0 != 0 }
+            self.lastSyncAt = Date()
             self.log("OK", "剩余药量 \(self.remainingU.map { String(format: "%.2fU", $0) } ?? "?")，输注开关 \(self.switchOn == true ? "开" : self.switchOn == false ? "关" : "?")")
+            self.readTodayTotal()
         }
+    }
+
+    /// 0x00FF 当日总量：4B 头 + 24 个小时量（2B/100），求和做“今日累计”。
+    func readTodayTotal() {
+        guard connected else { return }
+        send(cmd: Cmd.GET_THE_TOTAL_AMOUNT_OF_DAY) { [weak self] f in
+            guard let self = self, let f = f else { return }
+            let p = Responses.decode(cmd: f.cmd, data: f.data)
+            let map = p.fields["map_amount"] as? [String: Any] ?? [:]
+            let vals = map.values.compactMap { $0 as? Double }
+            if !vals.isEmpty {
+                self.todayTotalU = vals.reduce(0, +)
+                self.log("OK", String(format: "今日累计 %.2fU", self.todayTotalU ?? 0))
+            }
+        }
+    }
+
+    /// 把泵时钟同步为手机当前时间（0x00A4）。
+    func syncPumpTime() {
+        let c = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: Date())
+        var dt = Params.SetDatetime(year: c.year ?? 2026, month: c.month ?? 1, day: c.day ?? 1,
+                                    hour: c.hour ?? 0, minute: c.minute ?? 0, second: c.second ?? 0)
+        dt.year = c.year ?? 2026
+        guard let payload = try? dt.bytes() else { return }
+        runCommand(Cmd.SET_THE_CURRENT_DATETIME, payload: payload)
+    }
+
+    /// 删除泵：断开并清掉保存的 UUID / 名称 / SN。
+    func forgetDevice() {
+        disconnect()
+        stopScan()
+        UserDefaults.standard.removeObject(forKey: lastDeviceKey)
+        UserDefaults.standard.removeObject(forKey: lastNameKey)
+        UserDefaults.standard.removeObject(forKey: "ipele.sn")
+        configure(sn: "", paddedEmpty: paddedEmpty)
+        currentName = ""
+        pumpVersionText = "—"
+        modelInfo = "—"
+        batteryPct = nil
+        todayTotalU = nil
+        lastSyncAt = nil
     }
 
     func readModel() {

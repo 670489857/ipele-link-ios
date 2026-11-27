@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-struct ContentView: View {
+struct EngineeringView: View {
     @ObservedObject var pump: PumpClient
 
     @AppStorage("ipele.sn") private var sn: String = ""
@@ -211,7 +211,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("IpeleLink")
+            .navigationTitle("工程与诊断")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("设置") { showSettings = true }
@@ -302,6 +302,12 @@ struct InfusionSheet: View {
     @State private var errorText = ""
 
     private var modes: [String] { ["大剂量", "TBR 百分比"] }
+
+    init(pump: PumpClient, initialMode: Int = 0, initialBolusKind: Int = 0) {
+        _pump = ObservedObject(wrappedValue: pump)
+        _mode = State(initialValue: initialMode)
+        _bolusKind = State(initialValue: initialBolusKind)
+    }
 
     var body: some View {
         NavigationView {
