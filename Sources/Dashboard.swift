@@ -83,14 +83,14 @@ struct ContentView: View {
                     Image(uiImage: hero)
                         .resizable()
                         .scaledToFit()
-                        .frame(maxHeight: 150)
-                        .frame(maxWidth: .infinity)
+                        .frame(maxWidth: 215, maxHeight: 108)
+                        .padding(.horizontal, 24)
                 } else {
                     Image(systemName: "drop.fill")
                         .font(.system(size: 56)).foregroundColor(.teal)
                         .frame(height: 130)
                 }
-                Text(pump.connected ? "已连接 · \(pump.currentName)" : "未连接")
+                Text(pump.connected ? "已连接 · \(serialNumber)" : "未连接")
                     .font(.caption)
                     .foregroundColor(pump.connected ? .secondary : .orange)
             }
@@ -225,9 +225,9 @@ struct ContentView: View {
     private var deviceCard: some View {
         VStack(spacing: 0) {
             sectionTitle("设备")
-            infoCell("泵名称", pump.connected ? "艾派乐 Elfin 2.0（\(pump.currentName)）" : "艾派乐 Elfin 2.0")
+            infoCell("泵名称", "艾派乐 Elfin 2.0")
             divider
-            infoCell("型号与序列号", "MTI-P IV · SN \(serialTail)")
+            infoCell("序列号", serialNumber)
             divider
             NavigationLink(destination: LogView(pump: pump)) {
                 row("通信日志与连接诊断", "查看或导出收发原文，排查蓝牙连接与配对状态")
@@ -327,7 +327,7 @@ struct ContentView: View {
     }
 
     private var connectionText: String {
-        if pump.connected { return serialTail == "—" ? "已连接" : "已连接（\(serialTail)）" }
+        if pump.connected { return serialNumber == "—" ? "已连接" : "已连接（\(serialNumber)）" }
         return pump.connecting ? "连接中…" : "未连接"
     }
 
@@ -353,10 +353,15 @@ struct ContentView: View {
         return regular + "\n" + "临时基础率：\(pump.tempBasalText)"
     }
 
-    private var serialTail: String {
+    /// 泵名 EV/EL/EI + 完整序列号，例如 EV1251007021 → 1251007021。
+    private var serialNumber: String {
         let t = pump.currentName.uppercased()
-        guard t.count >= 8 else { return "—" }
-        return String(t.suffix(8))
+        guard !t.isEmpty else { return "—" }
+        if t.hasPrefix("EV") || t.hasPrefix("EL") || t.hasPrefix("EI") {
+            let s = String(t.dropFirst(2))
+            return s.isEmpty ? "—" : s
+        }
+        return t
     }
 
     private var lastSyncText: String {
@@ -450,7 +455,7 @@ struct StopInfusionSheet: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(footer: Text("只取消临时基础率和大剂量；常规基础率不会停，泵会继续按当前方案输注。")) {
+                Section(footer: Text("只取消临时基础率和大剂量；常规基础率不会停。取消大剂量成功后会按剩余时间把未输注部分从本地 1 小时累计扣回。")) {
                     Button("取消临时基础率（0x00A5）") { pump.cancelTBR() }
                     Button("取消大剂量（0x00A6）") { pump.cancelBolus() }
                 }

@@ -83,7 +83,11 @@ final class PumpClient: NSObject, ObservableObject {
     private var txChunks: [Data] = []
     private var txIndex = 0
     private var lastSendAt = Date.distantPast
-    private struct DoseEntry: Codable { let at: Date; let units: Double }
+    private struct DoseEntry: Codable {
+        let at: Date
+        var units: Double
+        var durationMinutes: Double? = nil
+    }
     private var doses: [DoseEntry] = []
     private let doseKey = "ipele.doses"
     private let lastDeviceKey = "ipele.lastPeripheral"
@@ -538,11 +542,34 @@ final class PumpClient: NSObject, ObservableObject {
         }
     }
 
-    private func recordDose(_ u: Double) {
+    private func recordDose(_ u: Double, durationMinutes: Int = 0) {
         guard u > 0 else { return }
         pruneDoses()
-        doses.append(DoseEntry(at: Date(), units: u))
+        doses.append(DoseEntry(at: Date(), units: u,
+                               durationMinutes: durationMinutes > 0 ? Double(durationMinutes) : nil))
         persistDoses()
+    }
+
+    /// 取消大剂量后，把「按时间还没输完」的那部分从本地 1 小时累计里扣回。
+    /// 常规大剂量时长为 0，已经即时输注，不扣；方波按剩余时间比例扣。
+    private func clawBackCancelledBolus() {
+        let now = Date()
+        var clawed = 0.0
+        for i in doses.indices {
+            guard let dur = doses[i].durationMinutes, dur > 0 else { continue }
+            let elapsedMin = now.timeIntervalSince(doses[i].at) / 60.0
+            let remainingRatio = max(0.0, min(1.0, 1.0 - elapsedMin / dur))
+            let remainingUnits = doses[i].units * remainingRatio
+            if remainingUnits > 0.0001 {
+                doses[i].units -= remainingUnits
+                clawed += remainingUnits
+            }
+        }
+        doses = doses.filter { $0.units > 0.0001 }
+        persistDoses()
+        if clawed > 0.0001 {
+            log("OK", String(format: "取消大剂量，扣回未输注 %.2fU；1 小时累计变为 %.2fU", clawed, sessionTotal()))
+        }
     }
 
     /// 只有泵明确应答、且不是错误码时才算「这次写入可能生效」。
@@ -1057,7 +1084,7 @@ final class PumpClient: NSObject, ObservableObject {
         send(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, payload: payload, allowNegotiate: false) { [weak self] f in
             guard let self = self else { return }
             self.summariseWrite(cmd: Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION, frame: f)
-            if self.ackAccepted(f) { self.recordDose(units) }
+            if self.ackAccepted(f) { self.recordDose(units, durationMinutes: minutes) }
             self.verifyAfterWrite(Cmd.TRIGGER_PREPRANDIAL_DOSE_INFUSION)
         }
         return g
@@ -1113,7 +1140,9 @@ final class PumpClient: NSObject, ObservableObject {
         busy = true
         // 同上：0x00A6 固定 4 个 0 字节。
         send(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, payload: [0, 0, 0, 0], allowNegotiate: false) { [weak self] f in
-            self?.summariseWrite(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, frame: f)
+            guard let self = self else { return }
+            self.summariseWrite(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, frame: f)
+            if self.ackAccepted(f) { self.clawBackCancelledBolus() }
         }
     }
 
