@@ -217,10 +217,10 @@ struct WritesView: View {
                 Button { open(.infusion) } label: {
                     Label("输注面板（0x00A2 / 0x00A3）", systemImage: "drop.fill").foregroundColor(.red)
                 }
-                Button { ask("取消当前的临时基础率？") { pump.runCommand(Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION) } } label: {
+                Button { ask("取消当前的临时基础率？") { pump.runCommand(Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION, payload: [0, 0, 0, 0]) } } label: {
                     Text("取消临时基础率（0x00A5）")
                 }
-                Button { ask("取消当前的大剂量输注？") { pump.runCommand(Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION) } } label: {
+                Button { ask("取消当前的大剂量输注？") { pump.runCommand(Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, payload: [0, 0, 0, 0]) } } label: {
                     Text("取消大剂量（0x00A6）")
                 }
             }

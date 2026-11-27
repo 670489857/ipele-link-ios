@@ -50,12 +50,17 @@ enum Params {
     }
 
     /// 0x00A3 大剂量（13B）：剂量2B 时长2B 波形1B 双波比1B 间隔2B 间隔开关1B + 4×0
+    ///
+    /// 波形不是 0：厂商插件 IpeleService.deliverTreatment() 里，普通大剂量固定
+    /// waveform = 3（泵名以 EI 开头）/ 4（其余机型）、dualRatio = 10、
+    /// interval = 10（构造函数把小于 10 的间隔抬到 10）、intervalSwitch = 0。
+    /// 之前填 0，泵一律回 code 3（参数错误）。
     struct Bolus {
         var unitsValue: Double
         var minutes: Int = 0
-        var waveform: Int = 0
-        var dualRatio: Int = 0
-        var intervalMinutes: Int = 0
+        var waveform: Int = 4
+        var dualRatio: Int = 10
+        var intervalMinutes: Int = 10
         var intervalSwitch: Int = 0
 
         func bytes() throws -> [UInt8] {
@@ -65,8 +70,8 @@ enum Params {
             guard (0...1440).contains(minutes) else {
                 throw Crypto.CryptoError(msg: "时长 \(minutes) 分钟超出 0–1440")
             }
-            guard (0...2).contains(waveform) else {
-                throw Crypto.CryptoError(msg: "波形 \(waveform) 超出 0–2")
+            guard (0...7).contains(waveform) else {
+                throw Crypto.CryptoError(msg: "波形 \(waveform) 超出 0–7")
             }
             guard (0...100).contains(dualRatio) else {
                 throw Crypto.CryptoError(msg: "双波比 \(dualRatio) 超出 0–100")

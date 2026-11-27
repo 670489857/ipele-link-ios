@@ -94,6 +94,7 @@ final class PumpClient: NSObject, ObservableObject {
     private var pendingCompletion: ((Frame?) -> Void)?
     private var timeoutArmed = false
     private var writeWatchdog: DispatchWorkItem?
+    private var retry80Used = false
 
     override init() {
         super.init()
@@ -196,6 +197,7 @@ final class PumpClient: NSObject, ObservableObject {
 
     func send(cmd: Int, payload: [UInt8] = [], padded: Bool? = nil,
               allowNegotiate: Bool = true,
+              isRetry80: Bool = false,
               completion: ((Frame?) -> Void)? = nil) {
         guard connected, let wc = writeChar, let p = peripheral else {
             completion?(nil)
@@ -209,6 +211,7 @@ final class PumpClient: NSObject, ObservableObject {
         }
 
         let usePadded = padded ?? (payload.isEmpty && paddedEmpty)
+        if !isRetry80 { retry80Used = false }
         seq = seq &+ 1
         let raw = Proto.build(cmd: cmd, data: payload, seq: Int(seq), padded: usePadded)
         let tx: [UInt8]
@@ -339,6 +342,28 @@ final class PumpClient: NSObject, ObservableObject {
         let bytes = [UInt8](data)
         if Responses.isRetryNotify(bytes) {
             log("RSP", "泵发来单字节 0x80：原厂语义「Command Invoke 80 error, try again!」")
+            guard pendingCB != nil else { return }
+            // 写入命令绝不自动重发；只读命令可以按原厂语义重试一次。
+            if (0x00A0...0x00A6).contains(pendingRaw) {
+                log("RSP", "写入命令 0x\(String(format: "%04X", pendingRaw)) 收到 0x80，不自动重发")
+                return
+            }
+            if retry80Used {
+                log("RSP", "0x80 重试已用过一次，继续等应答")
+                return
+            }
+            retry80Used = true
+            let cmd = pendingRaw
+            let payload = pendingPayload
+            let usePadded = pendingPadded
+            let allow = pendingAllow
+            let cb = pendingCompletion
+            log("SYS", "泵要求重试 0x\(String(format: "%04X", cmd))：0.35s 后重发（仅一次）")
+            clearPending()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                self?.send(cmd: cmd, payload: payload, padded: usePadded,
+                           allowNegotiate: allow, isRetry80: true, completion: cb)
+            }
             return
         }
 
@@ -372,10 +397,12 @@ final class PumpClient: NSObject, ObservableObject {
                 lastAck = "0x\(String(format: "%04X", f.cmd)) 数据"
                 log("DEC", "\(parsed.name)：\(parsed.summary)")
             }
-            // 厂商固件有的回 cmd|0x8000，有的原样回 cmd；两种都认，seq 不一致只记日志不丢弃。
+            // 泵会把一条命令的数据拆成多帧（同 seq）。seq 必须对上，否则上一轮
+            // 迟到的分帧会把新一轮请求提前“完成”（0x00F2 就踩过这个坑）。
             if f.cmd == pendingCmd || (pendingRaw != 0 && f.cmd == pendingRaw) {
                 if f.seq != pendingSeq && f.seq != 0 {
-                    log("RSP", "seq 不一致（泵 \(f.seq) / 本机 \(pendingSeq)），仍按 cmd 匹配接受")
+                    log("RSP", "seq 不一致（泵 \(f.seq) / 本机 \(pendingSeq)），忽略该帧")
+                    continue
                 }
                 let code = Responses.isErrorFrame(len: f.data.count + Proto.headerLen, f.data)
                     ? (f.data.first.map { Int($0) } ?? -1) : nil
@@ -569,27 +596,65 @@ final class PumpClient: NSObject, ObservableObject {
 
     /// 读基础量方案（0x00F2），取当前小时的基础率。
     /// 百分比 TBR 必须先有它，否则算不出绝对剂量。
+    ///
+    /// 泵会把 0–23 点表拆成两帧回（例：0–15 一帧、16–23 一帧）。只认第一帧会丢
+    /// 16:00–23:00 的段，所以这里按应答里的 end_time_point 分段续读并合并。
+    private var basalAccum: [Int: Double] = [:]
+
     func readBasalPlan() {
+        guard connected else {
+            basalText = "未连接"
+            return
+        }
+        basalAccum = [:]
+        basalText = "读取中…"
+        requestBasalSegment(from: 0)
+    }
+
+    private func requestBasalSegment(from s: Int) {
+        let lastPoint = 0x17
+        guard s <= lastPoint else { finishBasal(); return }
         // 厂商 BasicQuantityPlanParameter.toByteArray() 是 3B：[mode][startTimePoint][endTimePoint]
-        // 之前发空载荷，泵直接回 code 3（参数错误），所以一直读不到点表。
-        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN, payload: [0x00, 0x00, 0x17]) { [weak self] p in
+        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN, payload: [0x00, UInt8(s), UInt8(lastPoint)]) { [weak self] p in
             guard let self = self else { return }
-            guard let p = p, let raw = p.fields["point_list"] as? [String: Double] else {
-                self.basalText = "读取失败：0x00F2 无有效点表"
+            guard let p = p, let raw = p.fields["point_list"] as? [String: Double],
+                  !raw.isEmpty else {
+                self.basalText = "读取失败：0x00F2 无有效点表（已读到 \(self.basalAccum.count) 段）"
+                self.basalRateNow = nil
                 return
             }
-            var map: [Int: Double] = [:]
-            for (k, v) in raw { if let h = Int(k) { map[h] = v } }
-            let hour = Calendar.current.component(.hour, from: Date())
-            let rate = self.rateForHour(hour, map)
-            self.basalRateNow = rate
-            if let r = rate {
-                self.basalText = String(format: "%02d:00 起 %.2f U/h（%d 个时段）", self.hourKey(hour, map), r, map.count)
-            } else {
-                self.basalText = "点表为空"
+            for (k, v) in raw { if let h = Int(k) { self.basalAccum[h] = v } }
+            let reached = p.int("end_time_point") ?? lastPoint
+            self.log("OK", "基础率分段 \(s)–\(min(reached, lastPoint)) 合并后共 \(self.basalAccum.count) 段")
+            if reached < s {
+                self.basalText = "读取失败：分段起点异常"
+                return
             }
-            self.log("OK", "基础率 \(self.basalText)")
+            if reached < lastPoint {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self.requestBasalSegment(from: reached + 1)
+                }
+            } else {
+                self.finishBasal()
+            }
         }
+    }
+
+    private func finishBasal() {
+        guard !basalAccum.isEmpty else {
+            basalText = "点表为空"
+            basalRateNow = nil
+            return
+        }
+        let hour = Calendar.current.component(.hour, from: Date())
+        let rate = rateForHour(hour, basalAccum)
+        basalRateNow = rate
+        if let r = rate {
+            basalText = String(format: "%02d:00 起 %.2f U/h（%d 个时段）", hourKey(hour, basalAccum), r, basalAccum.count)
+        } else {
+            basalText = "点表为空"
+        }
+        log("OK", "基础率 \(basalText)")
     }
 
     /// 一键采集：把排查大剂量失败最需要的 5 条读取串起来跑，日志里会有完整收发。
@@ -652,7 +717,7 @@ final class PumpClient: NSObject, ObservableObject {
         }
     }
 
-    func sendBolus(units: Double, minutes: Int = 0, waveform: Int = 0) -> Guard.Result {
+    func sendBolus(units: Double, minutes: Int = 0, waveform: Int? = nil) -> Guard.Result {
         let g = Guard.checkBolus(units: units, remaining: remainingU, switchOn: switchOn,
                                  sessionUnits: sessionTotal(), waterTest: waterTest)
         guard g.ok else {
@@ -661,7 +726,13 @@ final class PumpClient: NSObject, ObservableObject {
         }
         var b = Params.Bolus(unitsValue: units)
         b.minutes = minutes
-        b.waveform = waveform
+        // 厂商 IpeleService.deliverTreatment()：泵名以 EI 开头用波形 3，其余机型用 4。
+        // 波形 0 只有「方波/延长」才合法，普通大剂量会被泵判参数错误（code 3）。
+        let isEI = currentName.uppercased().hasPrefix("EI")
+        b.waveform = waveform ?? (isEI ? 3 : 4)
+        b.dualRatio = 10
+        b.intervalMinutes = 10
+        b.intervalSwitch = 0
         let payload: [UInt8]
         do { payload = try b.bytes() } catch {
             return Guard.Result(ok: false, msg: error.localizedDescription)
@@ -715,14 +786,17 @@ final class PumpClient: NSObject, ObservableObject {
 
     func cancelTBR() {
         busy = true
-        send(cmd: Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION, allowNegotiate: false) { [weak self] f in
+        // 厂商 CancelTemporaryBasicVolumeInfusionParameter.toByteArray() 是 4 个 0 字节，
+        // 不是空载荷 + FF（空载荷会被泵判 code 3）。
+        send(cmd: Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION, payload: [0, 0, 0, 0], allowNegotiate: false) { [weak self] f in
             self?.summariseWrite(cmd: Cmd.CANCEL_TEMPORARY_BASIC_VOLUME_INFUSION, frame: f)
         }
     }
 
     func cancelBolus() {
         busy = true
-        send(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, allowNegotiate: false) { [weak self] f in
+        // 同上：0x00A6 固定 4 个 0 字节。
+        send(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, payload: [0, 0, 0, 0], allowNegotiate: false) { [weak self] f in
             self?.summariseWrite(cmd: Cmd.CANCEL_PRE_MEAL_VOLUME_INFUSION, frame: f)
         }
     }

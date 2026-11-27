@@ -79,6 +79,12 @@ var threwDose = false
 do { _ = try Params.Bolus(unitsValue: 30).bytes() } catch { threwDose = true }
 check("剂量 30U 抛错", threwDose)
 
+// 普通大剂量必须带厂商的波形/比值/间隔：0.10U → 00 0A 00 00 04 0A 00 0A 00 + 4×0
+let bolus01 = (try? Params.Bolus(unitsValue: 0.10).bytes()) ?? []
+check("0.10U 大剂量字节=厂商布局",
+      bolus01 == [0x00, 0x0A, 0, 0, 0x04, 0x0A, 0, 0x0A, 0, 0, 0, 0, 0],
+      "got \(bolus01.hex)")
+
 var threwMin = false
 do { _ = try Params.TempBasal(rateUPerHour: 0.5, percent: nil, minutes: 0).bytes() } catch { threwMin = true }
 check("时长 0 分钟抛错", threwMin)
