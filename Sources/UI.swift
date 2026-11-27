@@ -167,7 +167,20 @@ struct ContentView: View {
 
                 Section(header: Text("诊断")) {
                     NavigationLink(destination: LogView(pump: pump), isActive: $showLog) {
-                        Text("通信日志（\(pump.logs.count)）")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("通信日志（\(pump.logs.count)）")
+                            Text("含原始收发包、解密后字节、返回码、耗时；可导出")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                    Button("一键采集诊断（5 条读取）") { pump.collectDiagnostics() }
+                    if let e = pump.lastExchange {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(String(format: "最近：0x%04X %@", e.cmd, e.name))
+                                .font(.caption).bold()
+                            Text("\(e.code.map { "返回码 \($0) · \(Responses.RSP_CODES[$0] ?? "未知")" } ?? e.note)  \(e.ms)ms")
+                                .font(.caption2).foregroundColor(e.code != nil && e.code != 0 ? .red : .secondary)
+                        }
                     }
                 }
             }
@@ -408,41 +421,145 @@ struct ConfirmView: View {
 
 struct LogView: View {
     @ObservedObject var pump: PumpClient
-    @Environment(\.dismiss) private var dismiss
+    @State private var filter = 0
+    @State private var query = ""
+    @State private var shareURL: URL? = nil
+    @State private var showShare = false
+    @State private var copied = false
+
+    private let filters = ["全部", "发送", "接收", "异常", "解析"]
+
+    private var filtered: [LogLine] {
+        pump.logs.filter { l in
+            let passTag: Bool
+            switch filter {
+            case 1: passTag = l.tag == "TX"
+            case 2: passTag = l.tag == "RX"
+            case 3: passTag = ["ERR", "RSP", "GUARD", "DX"].contains(l.tag)
+            case 4: passTag = ["DEC", "OK", "CFG", "SYS"].contains(l.tag)
+            default: passTag = true
+            }
+            let q = query.trimmingCharacters(in: .whitespaces)
+            let passQuery = q.isEmpty
+                || l.text.localizedCaseInsensitiveContains(q)
+                || l.tag.localizedCaseInsensitiveContains(q)
+            return passTag && passQuery
+        }
+    }
 
     var body: some View {
-        List {
-            ForEach(pump.logs) { l in
-                VStack(alignment: .leading, spacing: 2) {
+        VStack(spacing: 0) {
+            Picker("", selection: $filter) {
+                ForEach(0..<filters.count, id: \.self) { i in Text(filters[i]).tag(i) }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 12).padding(.top, 8)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                TextField("搜 0x00A3 / 返回码 / code / 超时", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                if !query.isEmpty { Button("清除") { query = "" }.font(.caption) }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+
+            if let e = pump.lastExchange {
+                VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text(l.time).font(.caption2).foregroundColor(.secondary)
-                        Text(l.tag).font(.caption2).bold()
-                            .foregroundColor(color(l.tag))
+                        Text(String(format: "最近一次 0x%04X %@", e.cmd, e.name)).font(.caption).bold()
+                        Spacer()
+                        Text("\(e.ms)ms").font(.caption2).foregroundColor(.secondary)
                     }
-                    Text(l.text).font(.system(.caption, design: .monospaced))
+                    Text(e.code.map { "返回码 \($0) · \(Responses.RSP_CODES[$0] ?? "未知")" } ?? e.note)
+                        .font(.caption2)
+                        .foregroundColor(e.code != nil && e.code != 0 ? .red : .secondary)
+                    Text("请求 " + e.requestHex).font(.system(.caption2, design: .monospaced))
+                        .lineLimit(2).foregroundColor(.secondary)
+                    Text("应答 " + e.responseHex).font(.system(.caption2, design: .monospaced))
+                        .lineLimit(2).foregroundColor(.secondary)
                 }
+                .padding(10)
+                .background(Color(.secondarySystemBackground))
+                .cornerRadius(10)
+                .padding(.horizontal, 12).padding(.bottom, 6)
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    if filtered.isEmpty {
+                        Text("没有匹配的日志").font(.caption).foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center).padding(.top, 30)
+                    }
+                    ForEach(filtered) { l in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(l.time).font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary).frame(width: 66, alignment: .leading)
+                            Text(l.tag).font(.system(.caption2, design: .monospaced)).bold()
+                                .foregroundColor(color(l.tag)).frame(width: 34, alignment: .leading)
+                            Text(l.text).font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.horizontal, 12).padding(.bottom, 30)
             }
         }
         .navigationTitle("通信日志")
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button("复制") { UIPasteboard.general.string = pump.logText() }
+                Button {
+                    export()
+                } label: { Image(systemName: "square.and.arrow.up") }
+            }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button(copied ? "已复制" : "复制") {
+                    UIPasteboard.general.string = pump.diagnosticReport()
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                }.font(.caption)
             }
             ToolbarItem(placement: .navigationBarLeading) {
                 Button("清空") { pump.clearLogs() }
             }
         }
+        .sheet(isPresented: $showShare) {
+            if let u = shareURL { ShareSheet(items: [u]) }
+        }
+    }
+
+    private func export() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "IpeleLink-diagnostic-\(df.string(from: Date())).txt"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try? pump.diagnosticReport().data(using: .utf8)?.write(to: url, options: .atomic)
+        shareURL = url
+        showShare = true
     }
 
     private func color(_ tag: String) -> Color {
         switch tag {
         case "ERR": return .red
+        case "RSP": return .orange
+        case "GUARD": return .purple
         case "TX": return .blue
         case "RX": return .green
-        case "OK": return .green
+        case "DX": return .pink
+        case "DEC": return .teal
         default: return .secondary
         }
     }
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }
 
 enum AppInfo {

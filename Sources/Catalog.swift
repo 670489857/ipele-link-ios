@@ -6,6 +6,7 @@ struct CommandDef: Identifiable {
     let group: String
     let indexBytes: Int   // 0=无入参，1=1B 起始索引，2=2B 起始索引
     let note: String
+    var fixedPayload: [UInt8]? = nil   // 固定载荷（如 0x00F2 需要 [mode,start,end]）
 }
 
 enum Catalog {
@@ -13,7 +14,7 @@ enum Catalog {
         // ---- 状态与设置
         CommandDef(id: Cmd.GET_REMAINMED_AND_ISWITCH, title: "剩余药量与输注开关", group: "状态与设置", indexBytes: 0, note: "2 字段"),
         CommandDef(id: Cmd.GET_PRE_MEAL_QUANTITY_PLAN, title: "餐前剂量方案", group: "状态与设置", indexBytes: 0, note: ""),
-        CommandDef(id: Cmd.GET_BASIC_QUANTITY_PLAN, title: "基础量方案", group: "状态与设置", indexBytes: 0, note: "3B 头 + 每点 3B"),
+        CommandDef(id: Cmd.GET_BASIC_QUANTITY_PLAN, title: "基础量方案", group: "状态与设置", indexBytes: 0, note: "3B 头 + 每点 3B（载荷 mode,start,end）", fixedPayload: [0x00, 0x00, 0x17]),
         CommandDef(id: Cmd.GET_TEMPORARY_BASIC_QUANTITY_PLAN, title: "临时基础量方案", group: "状态与设置", indexBytes: 0, note: ""),
         CommandDef(id: Cmd.GET_PARAMETER_SETTINGS, title: "参数设置", group: "状态与设置", indexBytes: 0, note: ""),
         CommandDef(id: Cmd.GET_SYSTEM_CONFIG, title: "系统配置", group: "状态与设置", indexBytes: 0, note: ""),
@@ -183,7 +184,7 @@ struct ReadGroupView: View {
             return
         }
         hint = ""
-        var payload: [UInt8] = []
+        var payload: [UInt8] = d.fixedPayload ?? []
         if d.indexBytes > 0 {
             let idx = Int(indexText.trimmingCharacters(in: .whitespaces)) ?? 1
             payload = d.indexBytes == 1

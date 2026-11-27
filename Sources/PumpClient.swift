@@ -15,6 +15,19 @@ struct LogLine: Identifiable {
     let text: String
 }
 
+/// 最近一次完整的命令交换，用来一眼看出「发的是什么、泵回了什么、错在哪」。
+struct LastExchange {
+    let cmd: Int
+    let name: String
+    let requestHex: String
+    let cipherHex: String
+    let responseHex: String
+    let code: Int?
+    let note: String
+    let ms: Int
+    let at: String
+}
+
 /// BLE 客户端 —— 对应 Android 的 IpeleBleClient。
 ///
 /// 与原版一致：单条命令串行、800ms 最小间隔、6s 响应超时、
@@ -40,6 +53,8 @@ final class PumpClient: NSObject, ObservableObject {
     @Published var verifyText = ""
     @Published var basalRateNow: Double? = nil
     @Published var basalText = "未读取"
+    @Published var lastExchange: LastExchange? = nil
+    @Published var lastNotifyRaw = ""
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -67,6 +82,11 @@ final class PumpClient: NSObject, ObservableObject {
     // 超时计时改为「最后一包写完后」才开始；这之前用写通道看门狗兜底
     private var pendingRaw = 0
     private var pendingSeq = 0
+    private var pendingTxHex = ""
+    private var pendingCipherHex = ""
+    private var pendingStartAt = Date()
+    private var pendingFramesHex = ""
+    private let logIO = DispatchQueue(label: "ipele.log.io", qos: .utility)
     private var pendingPayload: [UInt8] = []
     private var pendingPadded = true
     private var pendingAllow = true
@@ -206,10 +226,14 @@ final class PumpClient: NSObject, ObservableObject {
         pendingCmd = cmd | 0x8000
         pendingCB = completion ?? { _ in }
         lastAck = "等待 0x\(String(format: "%04X", cmd)) 应答…"
-        log("TX", "0x\(String(format: "%04X", cmd)) \(Cmd.name(cmd))  明文 \(raw.hex)\(key != nil ? "  → 密文 \(tx.count)B" : "")")
+        log("TX", "0x\(String(format: "%04X", cmd)) \(Cmd.name(cmd))  seq=\(seq) LEN=\(raw[2]) 载荷\(payload.count)B  明文 \(raw.hex)" + (key != nil ? "  密文 \(tx.count)B \(tx.hex)" : ""))
 
         pendingRaw = cmd
         pendingSeq = Int(seq)
+        pendingTxHex = raw.hex
+        pendingCipherHex = tx.hex
+        pendingStartAt = Date()
+        pendingFramesHex = ""
         pendingPayload = payload
         pendingPadded = usePadded
         pendingAllow = allowNegotiate
@@ -280,6 +304,8 @@ final class PumpClient: NSObject, ObservableObject {
             }
             self.log("RSP", "0x\(String(format: "%04X", cmd)) 超时 \(Proto.responseTimeoutMs)ms，未自动重发")
             self.lastAck = "超时"
+            self.recordExchange(cmd: cmd, request: self.pendingTxHex, cipher: self.pendingCipherHex,
+                                response: "", code: nil, note: "超时 \(Proto.responseTimeoutMs)ms 无应答")
             self.finishPending(nil)
         }
         timeoutItem = item
@@ -315,6 +341,9 @@ final class PumpClient: NSObject, ObservableObject {
             return
         }
 
+        lastNotifyRaw = bytes.hex
+        log("RX", "原始 \(bytes.count)B \(bytes.hex)")
+
         var plain = bytes
         if let k = key {
             do {
@@ -330,7 +359,8 @@ final class PumpClient: NSObject, ObservableObject {
 
         let frames = assembler.feed(plain)
         for f in frames {
-            log("RX", "0x\(String(format: "%04X", f.cmd)) \(Cmd.name(f.cmd))  \(f.data.hex)")
+            log("RX", "帧 cmd=0x\(String(format: "%04X", f.cmd)) seq=\(f.seq) LEN=\(f.data.count + Proto.headerLen) data=\(f.data.hex)")
+            pendingFramesHex += (pendingFramesHex.isEmpty ? "" : " | ") + "0x\(String(format: "%04X", f.cmd))/seq\(f.seq)/\(f.data.hex)"
             if Responses.isErrorFrame(len: f.data.count + Proto.headerLen, f.data) {
                 let code = f.data.first.map { Int($0) } ?? -1
                 let meaning = Responses.RSP_CODES[code] ?? "未定义的返回码"
@@ -346,6 +376,10 @@ final class PumpClient: NSObject, ObservableObject {
                 if f.seq != pendingSeq && f.seq != 0 {
                     log("RSP", "seq 不一致（泵 \(f.seq) / 本机 \(pendingSeq)），仍按 cmd 匹配接受")
                 }
+                let code = Responses.isErrorFrame(len: f.data.count + Proto.headerLen, f.data)
+                    ? (f.data.first.map { Int($0) } ?? -1) : nil
+                recordExchange(cmd: pendingRaw, request: pendingTxHex, cipher: pendingCipherHex,
+                               response: pendingFramesHex, code: code, note: code == nil ? "收到应答" : "错误应答")
                 finishPending(f)
             }
         }
@@ -535,7 +569,9 @@ final class PumpClient: NSObject, ObservableObject {
     /// 读基础量方案（0x00F2），取当前小时的基础率。
     /// 百分比 TBR 必须先有它，否则算不出绝对剂量。
     func readBasalPlan() {
-        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN) { [weak self] p in
+        // 厂商 BasicQuantityPlanParameter.toByteArray() 是 3B：[mode][startTimePoint][endTimePoint]
+        // 之前发空载荷，泵直接回 code 3（参数错误），所以一直读不到点表。
+        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN, payload: [0x00, 0x00, 0x17]) { [weak self] p in
             guard let self = self else { return }
             guard let p = p, let raw = p.fields["point_list"] as? [String: Double] else {
                 self.basalText = "读取失败：0x00F2 无有效点表"
@@ -553,6 +589,34 @@ final class PumpClient: NSObject, ObservableObject {
             }
             self.log("OK", "基础率 \(self.basalText)")
         }
+    }
+
+    /// 一键采集：把排查大剂量失败最需要的 5 条读取串起来跑，日志里会有完整收发。
+    func collectDiagnostics() {
+        guard connected else {
+            log("SYS", "未连接泵，无法采集诊断")
+            return
+        }
+        let steps: [(Int, [UInt8])] = [
+            (Cmd.GET_REMAINMED_AND_ISWITCH, []),
+            (Cmd.GET_VERSION, []),
+            (Cmd.GET_PARAMETER_SETTINGS, []),
+            (Cmd.GET_BASIC_QUANTITY_PLAN, [0x00, 0x00, 0x17]),
+            (Cmd.GET_ALL_INFUSION_SETTING_INFORMATION, [])
+        ]
+        log("SYS", "开始一键采集诊断，共 \(steps.count) 条读取")
+        func next(_ i: Int) {
+            guard i < steps.count else {
+                log("SYS", "诊断采集完成：去「通信日志」右上角导出 txt 发我")
+                lastAck = "诊断采集完成"
+                return
+            }
+            let (cmd, payload) = steps[i]
+            runCommand(cmd, payload: payload) { _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { next(i + 1) }
+            }
+        }
+        next(0)
     }
 
     private func rateForHour(_ h: Int, _ map: [Int: Double]) -> Double? {
@@ -590,7 +654,10 @@ final class PumpClient: NSObject, ObservableObject {
     func sendBolus(units: Double, minutes: Int = 0, waveform: Int = 0) -> Guard.Result {
         let g = Guard.checkBolus(units: units, remaining: remainingU, switchOn: switchOn,
                                  sessionUnits: sessionTotal(), waterTest: waterTest)
-        guard g.ok else { return g }
+        guard g.ok else {
+            log("GUARD", "拒绝大剂量 \(units)U：\(g.msg)")
+            return g
+        }
         var b = Params.Bolus(unitsValue: units)
         b.minutes = minutes
         b.waveform = waveform
@@ -613,7 +680,10 @@ final class PumpClient: NSObject, ObservableObject {
                                remaining: remainingU, switchOn: switchOn,
                                sessionUnits: sessionTotal(), waterTest: waterTest,
                                basalRate: basalRateNow)
-        guard g.ok else { return g }
+        guard g.ok else {
+            log("GUARD", "拒绝临时基础率 \(rate.map { String(format: "%.2fU/h", $0) } ?? "百分比 \(percent.map(String.init) ?? "?")%"）：\(g.msg)")
+            return g
+        }
         do {
             let payload = try Params.TempBasal(rateUPerHour: rate, percent: percent, minutes: minutes).bytes()
             busy = true
@@ -673,13 +743,86 @@ final class PumpClient: NSObject, ObservableObject {
     // ------------------------------------------------------------ 日志
 
     func log(_ tag: String, _ text: String) {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss.SSS"
-        let line = LogLine(time: f.string(from: Date()), tag: tag, text: text)
+        let t = DateFormatter()
+        t.dateFormat = "HH:mm:ss.SSS"
+        let full = DateFormatter()
+        full.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        let now = Date()
+        let line = LogLine(time: t.string(from: now), tag: tag, text: text)
         DispatchQueue.main.async {
             self.logs.append(line)
-            if self.logs.count > 600 { self.logs.removeFirst(self.logs.count - 600) }
+            if self.logs.count > 2000 { self.logs.removeFirst(self.logs.count - 2000) }
         }
+        let disk = "\(full.string(from: now)) [\(tag)] \(text)\n"
+        logIO.async { [weak self] in
+            guard let self = self else { return }
+            let url = self.logFileURL
+            if let h = try? FileHandle(forWritingTo: url) {
+                defer { try? h.close() }
+                _ = try? h.seekToEnd()
+                if let d = disk.data(using: .utf8) { try? h.write(contentsOf: d) }
+            } else {
+                try? disk.data(using: .utf8)?.write(to: url, options: .atomic)
+            }
+        }
+    }
+
+    private var logFileURL: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("IpeleLinkLogs", isDirectory: true)
+        try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        return base.appendingPathComponent("log-\(df.string(from: Date())).txt")
+    }
+
+    private func recordExchange(cmd: Int, request: String, cipher: String,
+                                response: String, code: Int?, note: String) {
+        let ms = Int(Date().timeIntervalSince(pendingStartAt) * 1000)
+        let t = DateFormatter()
+        t.dateFormat = "HH:mm:ss"
+        let e = LastExchange(cmd: cmd, name: Cmd.name(cmd), requestHex: request, cipherHex: cipher,
+                             responseHex: response.isEmpty ? "（无应答）" : response,
+                             code: code, note: note, ms: ms, at: t.string(from: Date()))
+        DispatchQueue.main.async {
+            self.lastExchange = e
+        }
+        let codeText = code.map { "code=\($0) \(Responses.RSP_CODES[$0] ?? "未知")" } ?? "code=—"
+        log("DX", "\(String(format: "0x%04X", cmd)) \(Cmd.name(cmd)) \(codeText) \(ms)ms \(note)")
+    }
+
+    /// 生成可直接发给开发分析的诊断文本：环境、配置、最近一次交换、状态快照、全量日志。
+    func diagnosticReport() -> String {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var out = ""
+        out += "IpeleLink 诊断报告\n"
+        out += "生成时间：\(df.string(from: Date()))\n"
+        out += "App：\(AppInfo.versionText)  iOS：\(UIDevice.current.systemVersion)  机型：\(UIDevice.current.model)\n"
+        out += "泵：\(currentName.isEmpty ? "未连接" : currentName)  蓝牙：\(bluetoothState)  状态：\(connected ? "已连接" : "未连接")\n"
+        out += "加密：\(encrypted ? "AES-128" : "明文")  \(snHint)\n"
+        out += "空载补 FF：\(paddedEmpty ? "是" : "否")\n"
+        if let p = peripheral {
+            out += "写入包长上限：\(p.maximumWriteValueLength(for: .withResponse))B\n"
+        }
+        out += "剩余药量：\(remainingU.map { String(format: "%.2fU", $0) } ?? "—")  开关：\(switchOn == nil ? "—" : (switchOn! ? "开" : "关"))\n"
+        out += "当前基础率：\(basalRateNow.map { String(format: "%.2fU/h", $0) } ?? "—")  \(basalText)\n"
+        out += "1 小时累计：\(String(format: "%.2fU", sessionTotal()))\n"
+        out += "自检：\(selfCheckText.isEmpty ? "—" : selfCheckText)\n"
+        out += "回读校验：\(verifyText.isEmpty ? "—" : verifyText)\n"
+        if let e = lastExchange {
+            out += "\n最近一次交换（\(e.at)）：0x\(String(format: "%04X", e.cmd)) \(e.name)\n"
+            out += "  请求明文：\(e.requestHex)\n"
+            out += "  请求密文：\(e.cipherHex)\n"
+            out += "  应答：\(e.responseHex)\n"
+            out += "  返回码：\(e.code.map { "\($0)（\(Responses.RSP_CODES[$0] ?? "未知")）" } ?? "无")\n"
+            out += "  耗时：\(e.ms)ms  \(e.note)\n"
+        }
+        out += "\n—— 全量日志（\(logs.count) 条）——\n"
+        out += logs.map { "\($0.time) [\($0.tag)] \($0.text)" }.joined(separator: "\n")
+        out += "\n"
+        return out
     }
 
     func clearLogs() { logs.removeAll() }
