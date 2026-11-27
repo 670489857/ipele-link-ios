@@ -890,7 +890,8 @@ final class PumpClient: NSObject, ObservableObject {
         }
     }
 
-    func sendBolus(units: Double, minutes: Int = 0, waveform: Int? = nil) -> Guard.Result {
+    func sendBolus(units: Double, minutes: Int = 0, waveform: Int? = nil,
+                   intervalMinutes: Int = 10, intervalSwitch: Int = 0) -> Guard.Result {
         let g = Guard.checkBolus(units: units, remaining: remainingU, switchOn: switchOn,
                                  sessionUnits: sessionTotal(), waterTest: waterTest)
         guard g.ok else {
@@ -904,8 +905,8 @@ final class PumpClient: NSObject, ObservableObject {
         let isEI = currentName.uppercased().hasPrefix("EI")
         b.waveform = waveform ?? (isEI ? 3 : 4)
         b.dualRatio = 10
-        b.intervalMinutes = 10
-        b.intervalSwitch = 0
+        b.intervalMinutes = intervalMinutes
+        b.intervalSwitch = intervalSwitch
         let payload: [UInt8]
         do { payload = try b.bytes() } catch {
             return Guard.Result(ok: false, msg: error.localizedDescription)

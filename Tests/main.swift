@@ -85,6 +85,13 @@ check("0.10U 大剂量字节=厂商布局",
       bolus01 == [0x00, 0x0A, 0, 0, 0x04, 0x0A, 0, 0x0A, 0, 0, 0, 0, 0],
       "got \(bolus01.hex)")
 
+// 方波（厂商 extendedBolus）：波形0 + 总时长 + 间隔60 + 开关1
+let square = (try? Params.Bolus(unitsValue: 1.0, minutes: 120, waveform: 0,
+                                intervalMinutes: 60, intervalSwitch: 1).bytes()) ?? []
+check("1.0U 方波字节=厂商布局",
+      square == [0x00, 0x64, 0x00, 0x78, 0x00, 0x0A, 0x00, 0x3C, 0x01, 0, 0, 0, 0],
+      "got \(square.hex)")
+
 var threwMin = false
 do { _ = try Params.TempBasal(rateUPerHour: 0.5, percent: nil, minutes: 0).bytes() } catch { threwMin = true }
 check("时长 0 分钟抛错", threwMin)

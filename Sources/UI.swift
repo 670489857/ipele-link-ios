@@ -292,7 +292,9 @@ struct InfusionSheet: View {
 
     @State private var mode = 0
     @State private var amount = ""
-    @State private var bolusDuration = "0"
+    @State private var bolusKind = 0
+    @State private var normalDuration = "0"
+    @State private var squareDuration = "120"
     @State private var tbrDuration = "30"
     @State private var percent = "100"
     @State private var waveform = 0
@@ -315,13 +317,22 @@ struct InfusionSheet: View {
                 }
                 Section(header: Text("参数")) {
                     if mode == 0 {
-                        HStack { Text("剂量 (U)"); TextField("0.10", text: $amount).keyboardType(.decimalPad) }
-                        HStack { Text("时长 (min，0=即刻)"); TextField("0", text: $bolusDuration).keyboardType(.numberPad) }
-                        Picker("波形", selection: $waveform) {
-                            Text("自动").tag(0)
-                            Text("3").tag(3)
-                            Text("4").tag(4)
+                        Picker("大剂量类型", selection: $bolusKind) {
+                            Text("常规大剂量").tag(0)
+                            Text("方波（矩形波）").tag(1)
                         }.pickerStyle(.segmented)
+                        HStack { Text("剂量 (U)"); TextField("0.10", text: $amount).keyboardType(.decimalPad) }
+                        if bolusKind == 0 {
+                            HStack { Text("时长 (min，0=即刻)"); TextField("0", text: $normalDuration).keyboardType(.numberPad) }
+                            Picker("波形", selection: $waveform) {
+                                Text("自动").tag(0)
+                                Text("3").tag(3)
+                                Text("4").tag(4)
+                            }.pickerStyle(.segmented)
+                        } else {
+                            HStack { Text("总时长 (min)"); TextField("120", text: $squareDuration).keyboardType(.numberPad) }
+                            Text("方波会把总量平均铺在总时长里，每 60 分钟输注一次").font(.caption2).foregroundColor(.secondary)
+                        }
                     } else {
                         HStack { Text("百分比 (%)"); TextField("100", text: $percent).keyboardType(.numberPad) }
                         HStack { Text("时长 (min)"); TextField("30", text: $tbrDuration).keyboardType(.numberPad) }
@@ -361,14 +372,19 @@ struct InfusionSheet: View {
         switch mode {
         case 0:
             guard let u = Guard.parseUnits(amount) else { errorText = "剂量必须是大于 0、最多两位小数的数字"; return }
-            guard let minutes = Int(bolusDuration.trimmingCharacters(in: .whitespaces)), minutes >= 0 else {
-                errorText = "时长必须是 0 或正整数（0 = 即刻）"; return
+            let isSquare = bolusKind == 1
+            let durationText = isSquare ? squareDuration : normalDuration
+            guard let minutes = Int(durationText.trimmingCharacters(in: .whitespaces)),
+                  isSquare ? minutes >= 10 : minutes >= 0 else {
+                errorText = isSquare ? "方波总时长必须是 ≥10 分钟的整数" : "时长必须是 0 或正整数（0 = 即刻）"
+                return
             }
             let r = Guard.checkBolus(units: u, remaining: pump.remainingU, switchOn: pump.switchOn,
                                      sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
-            let res = pump.sendBolus(units: u, minutes: minutes,
-                                     waveform: waveform == 0 ? nil : waveform)
+            let res = isSquare
+                ? pump.sendBolus(units: u, minutes: minutes, waveform: 0, intervalMinutes: 60, intervalSwitch: 1)
+                : pump.sendBolus(units: u, minutes: minutes, waveform: waveform == 0 ? nil : waveform)
             if res.ok { sent = true } else { errorText = res.msg }
         case 1:
             guard let p = Int(percent.trimmingCharacters(in: .whitespaces)) else { errorText = "百分比必须是整数"; return }
