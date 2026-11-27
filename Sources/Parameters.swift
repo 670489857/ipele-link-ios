@@ -98,7 +98,8 @@ enum Params {
 
     /// 0x00A0 泵限值（10B）：浓度/最低剂量/最大大剂量/最大基础率 各1B + 限量2B + 4×0
     struct PumpLimits {
-        var concentration: Int = 100
+        // 泵内浓度是代码：1 = U100（100 U/ml），0 = U40（40 U/ml）。
+        var concentration: Int = 1
         var lowDosage: Int = 1
         var maxBolus: Int = 10
         var maxBasal: Int = 3

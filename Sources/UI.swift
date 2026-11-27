@@ -386,6 +386,8 @@ struct InfusionSheet: View {
             guard r.ok else { errorText = r.msg; return }
             let res = pump.sendTBR(rate: nil, percent: p, minutes: minutes)
             if res.ok { sent = true } else { errorText = res.msg }
+        default:
+            break
         }
     }
 }

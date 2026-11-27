@@ -260,7 +260,7 @@ struct LimitsSheet: View {
     @ObservedObject var pump: PumpClient
     @Environment(\.dismiss) private var dismiss
 
-    @State private var concentration = "100"
+    @State private var concentration = "1"
     @State private var lowDosage = "1"
     @State private var maxBolus = "10"
     @State private var maxBasal = "3"
@@ -272,9 +272,12 @@ struct LimitsSheet: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("泵内整数原值"),
-                        footer: Text("先点下面「读取泵内当前值（0x00E5）」，按泵实际值改，不要凭默认值硬发。")) {
-                    row("浓度", $concentration)
+                Section(header: Text("泵参数"),
+                        footer: Text("浓度按泵内代码写：U100 = 1，界面显示 100 U/ml；U40 = 0。先点下面「读取泵内当前值（0x00E5）」，按泵实际值改。")) {
+                    Picker("浓度", selection: $concentration) {
+                        Text("U100（100 U/ml）").tag("1")
+                        Text("U40（40 U/ml）").tag("0")
+                    }
                     row("最低剂量", $lowDosage)
                     row("最大大剂量", $maxBolus)
                     row("最大基础率", $maxBasal)
@@ -312,7 +315,12 @@ struct LimitsSheet: View {
         pump.runCommand(Cmd.GET_ALL_INFUSION_SETTING_INFORMATION) { p in
             DispatchQueue.main.async {
                 guard let p = p else { err = "0x00E5 无应答"; return }
-                if let v = p.int("concentration") { concentration = String(v) }
+                // 泵内 concentration 是代码：1=U100(100 U/ml)、0=U40(40 U/ml)，不能把 1 当 1 U/ml 显示/下发。
+                if let v = p.int("concentration") {
+                    if v == 100 { concentration = "1" }
+                    else if v == 40 { concentration = "0" }
+                    else { concentration = String(v) }
+                }
                 if let v = p.int("low_dosage_threshold") { lowDosage = String(v) }
                 if let v = p.int("maximum_amount") { maxBolus = String(v) }
                 if let v = p.int("maximum_basic_quantity") { maxBasal = String(v) }

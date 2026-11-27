@@ -185,6 +185,17 @@ enum L {
         return nil
     }
 
+    static func concentrationText(_ v: Any) -> String {
+        if let i = int(v) {
+            if i == 1 { return "U100（100 U/ml）" }
+            if i == 0 { return "U40（40 U/ml）" }
+            if i == 100 { return "100 U/ml" }
+            if i == 40 { return "40 U/ml" }
+            return "\(i)（泵内代码）"
+        }
+        return valueText(v)
+    }
+
     static func valueText(_ v: Any) -> String {
         if let b = v as? Bool { return b ? "是" : "否" }
         if let i = v as? Int { return String(i) }
@@ -199,6 +210,10 @@ enum L {
     }
 
     private static func walk(_ v: Any, prefix: String, into out: inout [(String, String)]) {
+        if !prefix.isEmpty && (prefix == "concentration" || prefix.hasSuffix(".concentration")) {
+            out.append((label(prefix), concentrationText(v)))
+            return
+        }
         if let d = v as? [String: Any] {
             if !prefix.isEmpty && isRecord(d) {
                 out.append((label(prefix), recordText(d)))

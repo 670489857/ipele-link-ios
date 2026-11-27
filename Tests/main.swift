@@ -107,6 +107,7 @@ let recFields: [String: Any] = ["records": ["2": recOne]]
 let recPairs = L.pairs(recFields)
 check("记录折叠成一行", recPairs.count == 1 && recPairs[0].0 == "记录 2", recPairs.map { "\($0.0)=\($0.1)" }.joined())
 check("记录时间可读", recPairs.first?.1.contains("2026-11-27 11:16:42") == true, recPairs.first?.1 ?? "")
+check("浓度代码 1 显示 U100", L.concentrationText(1).contains("U100") && L.concentrationText(1).contains("100 U/ml"), L.concentrationText(1))
 
 // 百分比 TBR：没有基础率、换算超 3U/h、水测试上限
 var g1 = Guard.checkTbr(rate: nil, percent: 100, minutes: 60, remaining: 50,
