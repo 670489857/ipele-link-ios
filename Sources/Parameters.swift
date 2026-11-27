@@ -151,7 +151,7 @@ enum Params {
         var setupMode: Int = 0
         var autoBasal: Double = 0
         var start: Int = 0
-        var end: Int = 23
+        var end: Int = 47
         var points: [Double] = []
 
         func bytes() throws -> [UInt8] {
@@ -159,8 +159,8 @@ enum Params {
             guard n > 0, points.count == n else {
                 throw Crypto.CryptoError(msg: "基础率点数 \(points.count) 与区间 \(n) 不匹配")
             }
-            guard (0...23).contains(start), (0...23).contains(end) else {
-                throw Crypto.CryptoError(msg: "起止点必须在 0–23")
+            guard (0...47).contains(start), (0...47).contains(end) else {
+                throw Crypto.CryptoError(msg: "起止点必须在 0–47（半小时点）")
             }
             for (i, v) in points.enumerated() where !(0...25).contains(v) {
                 throw Crypto.CryptoError(msg: "第 \(i + start) 点 \(v) U/h 超出 0–25")
@@ -168,11 +168,11 @@ enum Params {
             var buf = [UInt8](repeating: 0, count: 8 + n * 2)
             buf[0] = UInt8(max(0, min(255, mode)))
             buf[1] = UInt8(max(0, min(255, setupMode)))
-            let a = units(autoBasal)
-            buf[2] = UInt8((a >> 8) & 0xFF)
-            buf[3] = UInt8(a & 0xFF)
-            buf[4] = 0
-            buf[5] = 0
+            let a = Int((autoBasal * 100).rounded())
+            buf[2] = UInt8((a >> 24) & 0xFF)
+            buf[3] = UInt8((a >> 16) & 0xFF)
+            buf[4] = UInt8((a >> 8) & 0xFF)
+            buf[5] = UInt8(a & 0xFF)
             buf[6] = UInt8(max(0, min(255, start)))
             buf[7] = UInt8(max(0, min(255, end)))
             var o = 8

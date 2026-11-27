@@ -227,6 +227,6 @@ struct ParsedResponse {
     func bool(_ k: String) -> Bool? { fields[k] as? Bool }
 
     var summary: String {
-        fields.keys.sorted().map { "\($0)=\(fields[$0]!)" }.joined(separator: "  ")
+        L.flatSummary(fields)
     }
 }

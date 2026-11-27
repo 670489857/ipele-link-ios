@@ -89,6 +89,25 @@ var threwMin = false
 do { _ = try Params.TempBasal(rateUPerHour: 0.5, percent: nil, minutes: 0).bytes() } catch { threwMin = true }
 check("时长 0 分钟抛错", threwMin)
 
+// 48 个半小时点：8B 头 + 48×2B，0.15U/h 铺满
+var basal48 = Params.BasalProfile()
+basal48.start = 0
+basal48.end = 47
+basal48.points = Array(repeating: 0.15, count: 48)
+let b48 = (try? basal48.bytes()) ?? []
+check("48 点基础率长度", b48.count == 104, "\(b48.count)B")
+check("48 点起止=0/47", b48.count == 104 && b48[6] == 0 && b48[7] == 47)
+check("48 点首尾=0.15U/h", b48.count == 104 && b48[8] == 0 && b48[9] == 15 && b48[102] == 0 && b48[103] == 15)
+
+// 记录页中文化：records.2.xxx 必须折叠成“记录 2 + 时间”
+let recOne: [String: Any] = ["year": 26, "month": 11, "day": 27,
+                             "hour": 11, "minute": 16, "second": 42,
+                             "operation_id": 123]
+let recFields: [String: Any] = ["records": ["2": recOne]]
+let recPairs = L.pairs(recFields)
+check("记录折叠成一行", recPairs.count == 1 && recPairs[0].0 == "记录 2", recPairs.map { "\($0.0)=\($0.1)" }.joined())
+check("记录时间可读", recPairs.first?.1.contains("2026-11-27 11:16:42") == true, recPairs.first?.1 ?? "")
+
 // 百分比 TBR：没有基础率、换算超 3U/h、水测试上限
 var g1 = Guard.checkTbr(rate: nil, percent: 100, minutes: 60, remaining: 50,
                         switchOn: true, sessionUnits: 0, waterTest: false, basalRate: nil)

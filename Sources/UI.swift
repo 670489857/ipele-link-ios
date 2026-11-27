@@ -139,14 +139,15 @@ struct ContentView: View {
                         }
                         Button("刷新状态（0x00F0）") { pump.refreshStatus() }
                         Button("读基础率（0x00F2）") { pump.readBasalPlan() }
-                        Button("读版本（0x00E9）") { pump.readModel() }
+                        Button("读协议版本（0x00E9）") { pump.readModel() }
+                        Button("读泵版本（0x00E8）") { pump.readPumpVersion() }
                         if pump.basalRateNow == nil {
                             Text(pump.basalText).font(.caption2).foregroundColor(.secondary)
                         }
                     }
 
                     Section(header: Text("工程模式 · 输注写入")) {
-                        Text("仅用于水测试。所有写入都会二次确认，超时不会自动重发。")
+                        Text("仅用于水测试。所有写入点一下直接下发，不再二次确认；超时不会自动重发。")
                             .font(.caption).foregroundColor(.secondary)
                         Button {
                             showInfusion = true
@@ -291,11 +292,11 @@ struct InfusionSheet: View {
 
     @State private var mode = 0
     @State private var amount = ""
-    @State private var duration = "60"
+    @State private var bolusDuration = "0"
+    @State private var tbrDuration = "60"
     @State private var percent = "100"
     @State private var waveform = 0
-    @State private var showConfirm = false
-    @State private var summary = ""
+    @State private var sent = false
     @State private var errorText = ""
 
     private var modes: [String] { ["大剂量", "TBR 速率", "TBR 百分比"] }
@@ -315,7 +316,7 @@ struct InfusionSheet: View {
                 Section(header: Text("参数")) {
                     if mode == 0 {
                         HStack { Text("剂量 (U)"); TextField("0.10", text: $amount).keyboardType(.decimalPad) }
-                        HStack { Text("时长 (min，0=即刻)"); TextField("0", text: $duration).keyboardType(.numberPad) }
+                        HStack { Text("时长 (min，0=即刻)"); TextField("0", text: $bolusDuration).keyboardType(.numberPad) }
                         Picker("波形", selection: $waveform) {
                             Text("自动").tag(0)
                             Text("3").tag(3)
@@ -323,18 +324,26 @@ struct InfusionSheet: View {
                         }.pickerStyle(.segmented)
                     } else if mode == 1 {
                         HStack { Text("速率 (U/h)"); TextField("0.50", text: $amount).keyboardType(.decimalPad) }
-                        HStack { Text("时长 (min)"); TextField("60", text: $duration).keyboardType(.numberPad) }
+                        HStack { Text("时长 (min)"); TextField("60", text: $tbrDuration).keyboardType(.numberPad) }
                     } else {
                         HStack { Text("百分比 (%)"); TextField("100", text: $percent).keyboardType(.numberPad) }
-                        HStack { Text("时长 (min)"); TextField("60", text: $duration).keyboardType(.numberPad) }
+                        HStack { Text("时长 (min)"); TextField("60", text: $tbrDuration).keyboardType(.numberPad) }
                     }
                 }
                 if !errorText.isEmpty {
                     Section { Text(errorText).foregroundColor(.red).font(.caption) }
                 }
                 Section {
-                    Button("校验并继续") { validate() }
+                    Button("直接下发（不二次确认）") { submit() }
                         .foregroundColor(.red)
+                }
+                if sent {
+                    Section(header: Text("泵应答")) {
+                        Text(pump.busy ? "下发中…" : pump.lastAck).font(.caption)
+                        if !pump.verifyText.isEmpty {
+                            Text(pump.verifyText).font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
                 }
                 Section(header: Text("当前状态参照")) {
                     Text("剩余药量 " + (pump.remainingU.map { String(format: "%.2f U", $0) } ?? "未知")
@@ -346,34 +355,40 @@ struct InfusionSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
             }
-            .sheet(isPresented: $showConfirm) {
-                ConfirmView(summary: summary) {
-                    execute()
-                }
-            }
         }
     }
 
-    private func validate() {
+    private func submit() {
         errorText = ""
-        let minutes = Int(duration.trimmingCharacters(in: .whitespaces)) ?? 0
+        sent = false
         switch mode {
         case 0:
             guard let u = Guard.parseUnits(amount) else { errorText = "剂量必须是大于 0、最多两位小数的数字"; return }
+            guard let minutes = Int(bolusDuration.trimmingCharacters(in: .whitespaces)), minutes >= 0 else {
+                errorText = "时长必须是 0 或正整数（0 = 即刻）"; return
+            }
             let r = Guard.checkBolus(units: u, remaining: pump.remainingU, switchOn: pump.switchOn,
                                      sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
-            let waveText = waveform == 0 ? "自动" : "波形 \(waveform)"
-            summary = "大剂量 \(String(format: "%.2f", u)) U，\(waveText)" + (minutes > 0 ? "，时长 \(minutes) min" : "")
+            let res = pump.sendBolus(units: u, minutes: minutes,
+                                     waveform: waveform == 0 ? nil : waveform)
+            if res.ok { sent = true } else { errorText = res.msg }
         case 1:
             guard let rate = Guard.parseUnits(amount) else { errorText = "速率必须是大于 0 的数字"; return }
+            guard let minutes = Int(tbrDuration.trimmingCharacters(in: .whitespaces)), minutes > 0 else {
+                errorText = "临时基础率时长必须大于 0 分钟"; return
+            }
             let r = Guard.checkTbr(rate: rate, percent: nil, minutes: minutes,
                                    remaining: pump.remainingU, switchOn: pump.switchOn,
                                    sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
             guard r.ok else { errorText = r.msg; return }
-            summary = String(format: "临时基础率 %.2f U/h × %d min", rate, minutes)
+            let res = pump.sendTBR(rate: rate, percent: nil, minutes: minutes)
+            if res.ok { sent = true } else { errorText = res.msg }
         default:
             guard let p = Int(percent.trimmingCharacters(in: .whitespaces)) else { errorText = "百分比必须是整数"; return }
+            guard let minutes = Int(tbrDuration.trimmingCharacters(in: .whitespaces)), minutes > 0 else {
+                errorText = "临时基础率时长必须大于 0 分钟"; return
+            }
             guard let basal = pump.basalRateNow else {
                 errorText = "百分比模式要先读基础率：先点「读基础率（0x00F2）」，读到当前时段基础率再用百分比；或改用速率模式"
                 return
@@ -383,73 +398,9 @@ struct InfusionSheet: View {
                                    sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest,
                                    basalRate: basal)
             guard r.ok else { errorText = r.msg; return }
-            let implied = basal * Double(p) / 100
-            summary = String(format: "临时基础率 %d%% ≈ %.2f U/h（按当前基础率 %.2f）× %d min", p, implied, basal, minutes)
+            let res = pump.sendTBR(rate: nil, percent: p, minutes: minutes)
+            if res.ok { sent = true } else { errorText = res.msg }
         }
-        showConfirm = true
-    }
-
-    private func execute() {
-        let minutes = Int(duration.trimmingCharacters(in: .whitespaces)) ?? 0
-        switch mode {
-        case 0:
-            if let u = Guard.parseUnits(amount) {
-                let r = pump.sendBolus(units: u, minutes: minutes,
-                                       waveform: waveform == 0 ? nil : waveform)
-                errorText = r.ok ? "" : r.msg
-            }
-        case 1:
-            if let rate = Guard.parseUnits(amount) {
-                let r = pump.sendTBR(rate: rate, percent: nil, minutes: minutes)
-                errorText = r.ok ? "" : r.msg
-            }
-        default:
-            if let p = Int(percent.trimmingCharacters(in: .whitespaces)) {
-                let r = pump.sendTBR(rate: nil, percent: p, minutes: minutes)
-                errorText = r.ok ? "" : r.msg
-            }
-        }
-        showConfirm = false
-    }
-}
-
-struct ConfirmView: View {
-    let summary: String
-    let onConfirm: () -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var left = 3
-    @State private var timer: Timer?
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 44)).foregroundColor(.red)
-            Text("再次确认").font(.title2).bold()
-            Text(summary).font(.title3)
-            Text("确认后将直接向泵下发写入命令，不做钳制、不自动重发。")
-                .font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center)
-            Button {
-                timer?.invalidate()
-                onConfirm()
-                dismiss()
-            } label: {
-                Text(left > 0 ? "确认下发（\(left)）" : "确认下发")
-                    .frame(maxWidth: .infinity).padding(.vertical, 12)
-                    .background(left > 0 ? Color.gray : Color.red)
-                    .foregroundColor(.white).cornerRadius(10)
-            }
-            .disabled(left > 0)
-            Button("取消") { timer?.invalidate(); dismiss() }
-                .foregroundColor(.secondary)
-        }
-        .padding(24)
-        .onAppear {
-            left = 3
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { t in
-                if left > 0 { left -= 1 } else { t.invalidate() }
-            }
-        }
-        .onDisappear { timer?.invalidate() }
     }
 }
 

@@ -448,7 +448,7 @@ final class PumpClient: NSObject, ObservableObject {
             } else {
                 let parsed = Responses.decode(cmd: f.cmd, data: f.data)
                 lastAck = "0x\(String(format: "%04X", f.cmd)) 数据"
-                log("DEC", "\(parsed.name)：\(parsed.summary)")
+                log("DEC", "\(L.responseName(parsed.name))：\(parsed.summary)")
             }
             // 泵会把一条命令的数据拆成多帧（同 seq）。seq 必须对上，否则上一轮
             // 迟到的分帧会把新一轮请求提前“完成”（0x00F2 就踩过这个坑）。
@@ -494,7 +494,7 @@ final class PumpClient: NSObject, ObservableObject {
             }
             let p = Responses.decode(cmd: f.cmd, data: f.data)
             self.lastParsed = p
-            self.lastAck = p.name
+            self.lastAck = L.responseName(p.name)
             completion(p)
             if verify { self.verifyAfterWrite(code) }
         }
@@ -596,7 +596,7 @@ final class PumpClient: NSObject, ObservableObject {
                 return
             }
             let p = Responses.decode(cmd: f.cmd, data: f.data)
-            var lines: [String] = ["回读 \(p.name)"]
+            var lines: [String] = ["回读 \(L.responseName(p.name))"]
             var mismatch = false
             for (k, v) in expected.sorted(by: { $0.key < $1.key }) {
                 let got = p.fields[k].map { "\($0)" } ?? "—"
@@ -822,9 +822,8 @@ final class PumpClient: NSObject, ObservableObject {
             let m2 = p.int("master_version2") ?? 0
             let m3 = p.int("master_version3") ?? 0
             let m4 = p.str("master_version4") ?? "0"
-            var master = [m1, m2, m3]
-            if let build = Int(m4, radix: 16), build != 0 { master.append(build) }
-            while master.count > 1 && master.last == 0 { master.removeLast() }
+            _ = m4
+            let master = [m1, m2, m3]
             let masterText = master.map { String($0) }.joined(separator: ".")
             let s1 = p.int("slave_version1") ?? 0
             let s2 = p.int("slave_version2") ?? 0
@@ -834,8 +833,8 @@ final class PumpClient: NSObject, ObservableObject {
             if let build = Int(s4, radix: 16), build != 0 { slave.append(build) }
             while slave.count > 1 && slave.last == 0 { slave.removeLast() }
             let slaveText = slave.map { String($0) }.joined(separator: ".")
-            self.pumpVersionText = "V\(hw) / V\(masterText)"
-            self.log("OK", "泵版本 \(self.pumpVersionText)（从 V\(slaveText)，工厂数据 \(p.summary)）")
+            self.pumpVersionText = "v\(masterText)"
+            self.log("OK", "泵版本 \(self.pumpVersionText)，硬件 V\(hw)，从版本 V\(slaveText)，工厂数据 \(p.summary)）")
             completion?(true)
         }
     }

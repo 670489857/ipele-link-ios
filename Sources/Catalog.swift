@@ -14,7 +14,7 @@ enum Catalog {
         // ---- 状态与设置
         CommandDef(id: Cmd.GET_REMAINMED_AND_ISWITCH, title: "剩余药量与输注开关", group: "状态与设置", indexBytes: 0, note: "2 字段"),
         CommandDef(id: Cmd.GET_PRE_MEAL_QUANTITY_PLAN, title: "餐前剂量方案", group: "状态与设置", indexBytes: 0, note: ""),
-        CommandDef(id: Cmd.GET_BASIC_QUANTITY_PLAN, title: "基础量方案", group: "状态与设置", indexBytes: 0, note: "3B 头 + 每点 3B（载荷 mode,start,end）", fixedPayload: [0x00, 0x00, 0x17]),
+        CommandDef(id: Cmd.GET_BASIC_QUANTITY_PLAN, title: "基础量方案", group: "状态与设置", indexBytes: 0, note: "3B 头 + 每点 3B（48 个半小时点 0–47）", fixedPayload: [0x00, 0x00, 0x2F]),
         CommandDef(id: Cmd.GET_TEMPORARY_BASIC_QUANTITY_PLAN, title: "临时基础量方案", group: "状态与设置", indexBytes: 0, note: ""),
         CommandDef(id: Cmd.GET_PARAMETER_SETTINGS, title: "参数设置", group: "状态与设置", indexBytes: 0, note: ""),
         CommandDef(id: Cmd.GET_SYSTEM_CONFIG, title: "系统配置", group: "状态与设置", indexBytes: 0, note: ""),
@@ -54,27 +54,7 @@ enum Catalog {
 // ---------------------------------------------------------------- 结果展示
 
 func prettyPairs(_ v: Any, prefix: String = "", into out: inout [(String, String)]) {
-    if let d = v as? [String: Any] {
-        for k in sortedKeys(Array(d.keys)) {
-            prettyPairs(d[k]!, prefix: prefix.isEmpty ? k : "\(prefix).\(k)", into: &out)
-        }
-    } else if let d = v as? [String: Double] {
-        for k in sortedKeys(Array(d.keys)) {
-            out.append((prefix.isEmpty ? k : "\(prefix).\(k)", String(format: "%.2f", d[k]!)))
-        }
-    } else if let d = v as? [String: Int] {
-        for k in sortedKeys(Array(d.keys)) {
-            out.append((prefix.isEmpty ? k : "\(prefix).\(k)", String(d[k]!)))
-        }
-    } else if let b = v as? Bool {
-        out.append((prefix, b ? "是" : "否"))
-    } else if let i = v as? Int {
-        out.append((prefix, String(i)))
-    } else if let d = v as? Double {
-        out.append((prefix, String(format: "%.2f", d)))
-    } else {
-        out.append((prefix, "\(v)"))
-    }
+    out.append(contentsOf: L.pairs(v, prefix: prefix))
 }
 
 private func sortedKeys(_ keys: [String]) -> [String] {
@@ -88,7 +68,7 @@ struct ResultSection: View {
     let result: ParsedResponse
 
     var body: some View {
-        Section(header: Text("结果 · \(result.name)")
+        Section(header: Text("结果 · \(L.responseName(result.name))")
             .textCase(nil)
             .font(.subheadline)) {
             let pairs = makePairs()
@@ -122,7 +102,7 @@ struct ResultSection: View {
 // ---------------------------------------------------------------- 全量命令面板
 
 enum SheetKind: String, Identifiable {
-    case infusion, limits, basal, confirm
+    case infusion, limits, basal
     var id: String { rawValue }
 }
 
@@ -200,14 +180,12 @@ struct ReadGroupView: View {
 struct WritesView: View {
     @ObservedObject var pump: PumpClient
     @State private var sheet: SheetKind? = nil
-    @State private var pendingSummary = ""
-    @State private var pendingAction: (() -> Void)? = nil
     @State private var hint = ""
 
     var body: some View {
         List {
             Section(footer: Text("未连接时只能浏览参数，下发会先被本地拒绝。")) {
-                Text("所有写入都要二次确认（3 秒倒计时），超时不会自动重发。")
+                Text("点一下直接下发，不再二次确认；本地安全校验仍然生效，超时不会自动重发。")
                     .font(.caption).foregroundColor(.secondary)
             }
             if !hint.isEmpty {
@@ -242,12 +220,6 @@ struct WritesView: View {
             case .infusion: InfusionSheet(pump: pump)
             case .limits: LimitsSheet(pump: pump)
             case .basal: BasalSheet(pump: pump)
-            case .confirm:
-                ConfirmView(summary: pendingSummary) {
-                    pendingAction?()
-                    pendingAction = nil
-                    sheet = nil
-                }
             }
         }
     }
@@ -268,9 +240,8 @@ struct WritesView: View {
 
     private func ask(_ summary: String, action: @escaping () -> Void) {
         guard online() else { return }
-        pendingSummary = summary
-        pendingAction = action
-        sheet = .confirm
+        _ = summary
+        action()
     }
 
     private func sendDateTime() {
@@ -294,13 +265,15 @@ struct LimitsSheet: View {
     @State private var maxBolus = "10"
     @State private var maxBasal = "3"
     @State private var limitQty = "50"
-    @State private var showConfirm = false
     @State private var err = ""
+    @State private var sent = false
+    @State private var loaded = false
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("单位语义未在真机核对，先按保守值")) {
+                Section(header: Text("泵内整数原值"),
+                        footer: Text("先点下面「读取泵内当前值（0x00E5）」，按泵实际值改，不要凭默认值硬发。")) {
                     row("浓度", $concentration)
                     row("最低剂量", $lowDosage)
                     row("最大大剂量", $maxBolus)
@@ -309,16 +282,23 @@ struct LimitsSheet: View {
                 }
                 if !err.isEmpty { Section { Text(err).foregroundColor(.red).font(.caption) } }
                 Section {
-                    Button("校验并下发") { check() }.foregroundColor(.red)
+                    Button("读取泵内当前值（0x00E5）") { loadFromPump() }
+                        .foregroundColor(.blue)
+                    Button("直接下发泵限值（0x00A0）") { checkAndSend() }
+                        .foregroundColor(.red)
+                }
+                if sent {
+                    Section(header: Text("泵应答")) {
+                        Text(pump.busy ? "下发中…" : pump.lastAck).font(.caption)
+                        if !pump.verifyText.isEmpty {
+                            Text(pump.verifyText).font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
                 }
             }
             .navigationTitle("泵限值 0x00A0")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }
-            .sheet(isPresented: $showConfirm) {
-                ConfirmView(summary: "写入泵限值：浓度 \(concentration) / 最低 \(lowDosage) / 最大大剂量 \(maxBolus) / 最大基础率 \(maxBasal) / 限量 \(limitQty)") {
-                    send()
-                }
-            }
+            .onAppear { if !loaded { loadFromPump() } }
         }
     }
 
@@ -326,83 +306,99 @@ struct LimitsSheet: View {
         HStack { Text(t); TextField("", text: b).keyboardType(.numberPad).multilineTextAlignment(.trailing) }
     }
 
-    private func check() {
+    private func loadFromPump() {
+        guard pump.connected else { err = "未连接泵，读不到当前值"; return }
         err = ""
+        pump.runCommand(Cmd.GET_ALL_INFUSION_SETTING_INFORMATION) { p in
+            DispatchQueue.main.async {
+                guard let p = p else { err = "0x00E5 无应答"; return }
+                if let v = p.int("concentration") { concentration = String(v) }
+                if let v = p.int("low_dosage_threshold") { lowDosage = String(v) }
+                if let v = p.int("maximum_amount") { maxBolus = String(v) }
+                if let v = p.int("maximum_basic_quantity") { maxBasal = String(v) }
+                if let v = p.int("limit_quantity") { limitQty = String(v) }
+                loaded = true
+            }
+        }
+    }
+
+    private func checkAndSend() {
+        err = ""
+        sent = false
         let vals = [concentration, lowDosage, maxBolus, maxBasal, limitQty].compactMap { Int($0) }
         guard vals.count == 5 else { err = "五个字段都必须是整数"; return }
         guard vals[0...3].allSatisfy({ $0 >= 0 && $0 <= 255 }) else { err = "前四个字段必须在 0..255"; return }
         guard vals[4] >= 0 && vals[4] <= 65535 else { err = "限量必须在 0..65535"; return }
-        showConfirm = true
-    }
-
-    private func send() {
         var p = Params.PumpLimits()
-        p.concentration = Int(concentration) ?? 100
-        p.lowDosage = Int(lowDosage) ?? 1
-        p.maxBolus = Int(maxBolus) ?? 10
-        p.maxBasal = Int(maxBasal) ?? 3
-        p.limitQuantity = Int(limitQty) ?? 50
-        guard let payload = try? p.bytes() else { err = "参数越界"; showConfirm = false; return }
+        p.concentration = vals[0]
+        p.lowDosage = vals[1]
+        p.maxBolus = vals[2]
+        p.maxBasal = vals[3]
+        p.limitQuantity = vals[4]
+        guard let payload = try? p.bytes() else { err = "参数越界"; return }
         pump.runCommand(Cmd.SET_INFUSION_PARAMETERS, payload: payload, verify: true)
-        showConfirm = false
+        sent = true
     }
 }
-
-// ---------------------------------------------------------------- 0x00A1 基础率方案
 
 struct BasalSheet: View {
     @ObservedObject var pump: PumpClient
     @Environment(\.dismiss) private var dismiss
 
-    @State private var values = "0"
-    @State private var showConfirm = false
+    @State private var rate = "0.15"
     @State private var err = ""
+    @State private var sent = false
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("24 个整点基础率，逗号分隔（U/h）"),
-                        footer: Text("例：0.5,0.5,0.6,0.6,0.6,0.7… 共 24 个值，对应 0:00–23:00。写入前先核对总日剂量。")) {
-                    TextField("0.5,0.5,…", text: $values)
-                        .font(.system(.caption, design: .monospaced))
+                Section(header: Text("默认基础率（U/h）"),
+                        footer: Text("填一个值，自动铺满 48 个半小时点：0:00、0:30 … 23:30，每点相同。")) {
+                    HStack {
+                        Text("每小时")
+                        TextField("0.15", text: $rate)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
                 }
                 if !err.isEmpty { Section { Text(err).foregroundColor(.red).font(.caption) } }
                 Section {
-                    Button("校验并下发") { check() }.foregroundColor(.red)
+                    Button("直接下发（48 个点）") { sendNow() }.foregroundColor(.red)
+                }
+                if sent {
+                    Section(header: Text("泵应答")) {
+                        Text(pump.busy ? "下发中…" : pump.lastAck)
+                            .font(.caption)
+                        if !pump.verifyText.isEmpty {
+                            Text(pump.verifyText).font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
                 }
             }
             .navigationTitle("基础率方案 0x00A1")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }
-            .sheet(isPresented: $showConfirm) {
-                ConfirmView(summary: "写入 24 段基础率：\(parsed().map { String(format: "%.2f", $0) }.joined(separator: "/")) U/h") {
-                    send()
-                }
-            }
         }
     }
 
-    private func parsed() -> [Double] {
-        values.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == " " })
-            .compactMap { Double(String($0)) }
-    }
-
-    private func check() {
+    private func sendNow() {
         err = ""
-        let v = parsed()
-        guard v.count == 24 else { err = "必须正好 24 个值，当前 \(v.count) 个"; return }
-        guard v.allSatisfy({ $0 >= 0 && $0 <= 20 }) else { err = "单个值应在 0..20 U/h"; return }
-        let total = v.reduce(0, +)
-        guard total <= 60 else { err = String(format: "日总量 %.2fU 过高，拒绝写入", total); return }
-        showConfirm = true
-    }
-
-    private func send() {
+        sent = false
+        let text = rate.replacingOccurrences(of: "，", with: ".").replacingOccurrences(of: ",", with: ".")
+        guard let v = Double(text), v >= 0, v <= 20 else {
+            err = "基础率必须是 0–20 U/h 的数字"
+            return
+        }
+        let total = v * 48
+        guard total <= 60 else {
+            err = String(format: "日总量 %.2fU 超过 60U，拒绝写入；请把每小时值降到 1.25 以下", total)
+            return
+        }
         var p = Params.BasalProfile()
         p.start = 0
-        p.end = 23
-        p.points = parsed()
-        guard let payload = try? p.bytes() else { err = "参数越界"; showConfirm = false; return }
+        p.end = 47
+        p.points = Array(repeating: v, count: 48)
+        guard let payload = try? p.bytes() else { err = "参数越界"; return }
         pump.runCommand(Cmd.SET_BASIC_VOLUME_INFUSION_PARAMETERS, payload: payload, verify: true)
-        showConfirm = false
+        sent = true
     }
 }
