@@ -100,7 +100,7 @@ struct ContentView: View {
                 Image(systemName: batterySymbol)
                 Text(batteryText)
             }
-            .font(.caption).bold()
+            .font(.caption.weight(.bold))
             .foregroundColor(batteryColor)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
