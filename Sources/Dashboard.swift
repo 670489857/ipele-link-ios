@@ -67,7 +67,8 @@ struct ContentView: View {
             }
             .onChange(of: pump.connected) { connected in
                 if connected {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { pump.readTodayTotal() }
+                    // 连接后 readBasalPlan 会自动串行读基础率→状态→今日总量；
+                    // 这里不再并发插一条 0x00FF，避免泵判“上一条命令仍在等待应答”。
                 }
             }
         }

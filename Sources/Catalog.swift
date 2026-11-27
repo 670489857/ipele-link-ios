@@ -401,12 +401,13 @@ struct BasalSheet: View {
             err = String(format: "日总量 %.2fU 超过 60U，拒绝写入；请把每小时值降到 1.25 以下", total)
             return
         }
-        var p = Params.BasalProfile()
-        p.start = 0
-        p.end = 47
-        p.points = Array(repeating: v, count: 48)
-        guard let payload = try? p.bytes() else { err = "参数越界"; return }
-        pump.runCommand(Cmd.SET_BASIC_VOLUME_INFUSION_PARAMETERS, payload: payload, verify: true)
         sent = true
+        pump.writeBasalProfile(points: Array(repeating: v, count: 48)) { ok, msg in
+            if ok {
+                pump.verifyText = msg
+            } else {
+                err = msg
+            }
+        }
     }
 }

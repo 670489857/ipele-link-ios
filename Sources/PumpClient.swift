@@ -107,6 +107,7 @@ final class PumpClient: NSObject, ObservableObject {
     private var timeoutArmed = false
     private var writeWatchdog: DispatchWorkItem?
     private var retry80Used = false
+    private var sendQueue: [() -> Void] = []
 
     override init() {
         super.init()
@@ -248,6 +249,7 @@ final class PumpClient: NSObject, ObservableObject {
         writeChar = nil
         notifyChar = nil
         assembler.reset()
+        sendQueue.removeAll()
         finishPending(nil)
         log("SYS", reason)
     }
@@ -263,9 +265,14 @@ final class PumpClient: NSObject, ObservableObject {
             log("ERR", "未连接，无法发送 0x\(String(format: "%04X", cmd))")
             return
         }
-        guard pendingCB == nil else {
-            completion?(nil)
-            log("ERR", "上一条命令仍在等待应答，拒绝并发发送")
+        if pendingCB != nil {
+            // 串行化：上一条还没回包时排队，避免自动读取和用户操作互相打断。
+            sendQueue.append { [weak self] in
+                self?.send(cmd: cmd, payload: payload, padded: padded,
+                           allowNegotiate: allowNegotiate, isRetry80: isRetry80,
+                           completion: completion)
+            }
+            log("QUE", "0x\(String(format: "%04X", cmd)) 已排队（前面还有命令在等应答）")
             return
         }
 
@@ -393,6 +400,13 @@ final class PumpClient: NSObject, ObservableObject {
         clearPending()
         busy = false
         cb?(f)
+        drainSendQueue()
+    }
+
+    private func drainSendQueue() {
+        guard pendingCB == nil, !sendQueue.isEmpty else { return }
+        let next = sendQueue.removeFirst()
+        next()
     }
 
     // ------------------------------------------------------------ 通知处理
@@ -693,46 +707,35 @@ final class PumpClient: NSObject, ObservableObject {
             basalText = "未连接"
             return
         }
-        // 先拿泵时间；拿不到就退回手机时间。失败后本次连接内不再反复重试。
-        let timeStale = pumpTimeAt.map { Date().timeIntervalSince($0) > 300 } ?? true
-        if timeStale && !timeResolving && !timeFailed {
-            timeResolving = true
-            readPumpTime { [weak self] ok in
-                guard let self = self else { return }
-                self.timeResolving = false
-                if !ok { self.timeFailed = true }
-                self.readBasalPlan()
-            }
-            return
-        }
+        // 不再阻塞等 0x00E7：泵时间读不到时先用手机时间选段，避免首页基础率一直空白。
         basalAccum = [:]
         basalText = "读取中…"
         requestBasalSegment(from: 0)
     }
 
     private func requestBasalSegment(from s: Int) {
-        // 厂商 BasicQuantityPlanParameter(0, 0, 47)：点表是 48 个半小时点，不是 24 个小时点。
+        // 厂商一次最多 16 个点（写也一样）。48 个半小时点分 3 段读，避免大帧被泵拒绝。
         let lastPoint = 0x2F
         guard s <= lastPoint else { finishBasal(); return }
-        // 厂商 BasicQuantityPlanParameter.toByteArray() 是 3B：[mode][startTimePoint][endTimePoint]
-        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN, payload: [0x00, UInt8(s), UInt8(lastPoint)]) { [weak self] p in
+        let end = min(s + 15, lastPoint)
+        // BasicQuantityPlanParameter.toByteArray() 是 3B：[mode][startTimePoint][endTimePoint]
+        runCommand(Cmd.GET_BASIC_QUANTITY_PLAN, payload: [0x00, UInt8(s), UInt8(end)]) { [weak self] p in
             guard let self = self else { return }
             guard let p = p, let raw = p.fields["point_list"] as? [String: Double],
                   !raw.isEmpty else {
-                self.basalText = "读取失败：0x00F2 无有效点表（已读到 \(self.basalAccum.count) 段）"
+                if let rc = p?.int("返回码") {
+                    self.basalText = "读取失败：0x00F2 返回码 \(rc)（已读到 \(self.basalAccum.count) 段）"
+                } else {
+                    self.basalText = "读取失败：0x00F2 无有效点表（已读到 \(self.basalAccum.count) 段）"
+                }
                 self.basalRateNow = nil
                 return
             }
             for (k, v) in raw { if let h = Int(k) { self.basalAccum[h] = v } }
-            let reached = p.int("end_time_point") ?? lastPoint
-            self.log("OK", "基础率分段 \(s)–\(min(reached, lastPoint)) 合并后共 \(self.basalAccum.count) 段")
-            if reached < s {
-                self.basalText = "读取失败：分段起点异常"
-                return
-            }
-            if reached < lastPoint {
+            self.log("OK", "基础率分段 \(s)–\(end) 合并后共 \(self.basalAccum.count) 段")
+            if end < lastPoint {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    self.requestBasalSegment(from: reached + 1)
+                    self.requestBasalSegment(from: end + 1)
                 }
             } else {
                 self.finishBasal()
@@ -765,7 +768,27 @@ final class PumpClient: NSObject, ObservableObject {
         readTempBasal { [weak self] in
             self?.readPumpVersion { [weak self] _ in
                 self?.refreshStatus()
+                // 放到队尾补读电量/泵时间；失败也不影响基础率显示。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    self?.readPumpTime { [weak self] ok in
+                        guard let self = self, ok, !self.basalAccum.isEmpty else { return }
+                        self.recomputeBasalNow()
+                    }
+                }
             }
+        }
+    }
+
+    private func recomputeBasalNow() {
+        guard !basalAccum.isEmpty else { return }
+        let hour = pumpHour ?? Calendar.current.component(.hour, from: Date())
+        let minute = pumpMinute ?? Calendar.current.component(.minute, from: Date())
+        let slot = slotForTime(hour, minute)
+        if let rate = rateForSlot(slot, basalAccum) {
+            basalRateNow = rate
+            basalDisplayRate = rate
+            let key = slotKey(slot, basalAccum)
+            basalText = String(format: "%@ 起 %.2f U/h（48 半小时点·%d 段，泵时间 %@）", slotLabel(key), rate, basalAccum.count, pumpTimeText)
         }
     }
 
@@ -894,9 +917,14 @@ final class PumpClient: NSObject, ObservableObject {
     /// 0x00FF 当日总量：4B 头 + 24 个小时量（2B/100），求和做“今日累计”。
     func readTodayTotal() {
         guard connected else { return }
-        send(cmd: Cmd.GET_THE_TOTAL_AMOUNT_OF_DAY) { [weak self] f in
+        // 厂商 TheTotalAmountOfDayParameter 必须带 1B index，空载荷会被泵判 code 3。
+        send(cmd: Cmd.GET_THE_TOTAL_AMOUNT_OF_DAY, payload: [0x00]) { [weak self] f in
             guard let self = self, let f = f else { return }
             let p = Responses.decode(cmd: f.cmd, data: f.data)
+            if let rc = p.int("返回码") {
+                self.log("ERR", "今日总量读取失败，返回码 \(rc)")
+                return
+            }
             let map = p.fields["map_amount"] as? [String: Any] ?? [:]
             let vals = map.values.compactMap { $0 as? Double }
             if !vals.isEmpty {
@@ -913,7 +941,19 @@ final class PumpClient: NSObject, ObservableObject {
                                     hour: c.hour ?? 0, minute: c.minute ?? 0, second: c.second ?? 0)
         dt.year = c.year ?? 2026
         guard let payload = try? dt.bytes() else { return }
-        runCommand(Cmd.SET_THE_CURRENT_DATETIME, payload: payload)
+        runCommand(Cmd.SET_THE_CURRENT_DATETIME, payload: payload) { [weak self] p in
+            guard let self = self else { return }
+            guard let p = p, let rc = p.int("返回码"), rc == 0 else {
+                self.log("ERR", "同步泵时间失败")
+                return
+            }
+            self.pumpHour = c.hour
+            self.pumpMinute = c.minute
+            self.pumpTimeAt = Date()
+            self.pumpTimeText = String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
+            self.log("OK", "泵时间已同步为 \(self.pumpTimeText)")
+            self.recomputeBasalNow()
+        }
     }
 
     /// 删除泵：断开并清掉保存的 UUID / 名称 / SN。
@@ -938,6 +978,58 @@ final class PumpClient: NSObject, ObservableObject {
             let p = Responses.decode(cmd: f.cmd, data: f.data)
             self.modelInfo = p.summary
         }
+    }
+
+    /// 0x00A1 基础率写入：泵一次最多接受 16 个点，48 点必须分 0–15 / 16–31 / 32–47 三帧。
+    func writeBasalProfile(points: [Double], completion: ((Bool, String) -> Void)? = nil) {
+        guard points.count == 48 else {
+            completion?(false, "基础率点数不是 48")
+            return
+        }
+        busy = true
+        func sendChunk(_ start: Int) {
+            let end = min(start + 15, 47)
+            var p = Params.BasalProfile()
+            p.start = start
+            p.end = end
+            p.points = Array(points[start...end])
+            guard let payload = try? p.bytes() else {
+                self.busy = false
+                completion?(false, "基础率参数越界")
+                return
+            }
+            self.send(cmd: Cmd.SET_BASIC_VOLUME_INFUSION_PARAMETERS, payload: payload,
+                      allowNegotiate: false) { [weak self] f in
+                guard let self = self else { return }
+                guard let f = f else {
+                    self.busy = false
+                    self.lastAck = "基础率写入超时（\(start)–\(end)）"
+                    completion?(false, self.lastAck)
+                    return
+                }
+                if Responses.isErrorFrame(len: f.data.count + Proto.headerLen, f.data) {
+                    let rc = f.data.first.map { Int($0) } ?? -1
+                    if rc != 0 {
+                        self.busy = false
+                        self.lastAck = "基础率写入返回码 \(rc)（\(start)–\(end)）"
+                        completion?(false, self.lastAck)
+                        return
+                    }
+                }
+                self.log("OK", "基础率写入 \(start)–\(end) 成功")
+                if end >= 47 {
+                    self.busy = false
+                    self.lastAck = "基础率 48 点写入完成（3 段）"
+                    self.verifyText = self.lastAck
+                    completion?(true, self.lastAck)
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        sendChunk(end + 1)
+                    }
+                }
+            }
+        }
+        sendChunk(0)
     }
 
     func sendBolus(units: Double, minutes: Int = 0, waveform: Int? = nil,
