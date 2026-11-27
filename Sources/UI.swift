@@ -293,13 +293,13 @@ struct InfusionSheet: View {
     @State private var mode = 0
     @State private var amount = ""
     @State private var bolusDuration = "0"
-    @State private var tbrDuration = "60"
+    @State private var tbrDuration = "30"
     @State private var percent = "100"
     @State private var waveform = 0
     @State private var sent = false
     @State private var errorText = ""
 
-    private var modes: [String] { ["大剂量", "TBR 速率", "TBR 百分比"] }
+    private var modes: [String] { ["大剂量", "TBR 百分比"] }
 
     var body: some View {
         NavigationView {
@@ -322,12 +322,9 @@ struct InfusionSheet: View {
                             Text("3").tag(3)
                             Text("4").tag(4)
                         }.pickerStyle(.segmented)
-                    } else if mode == 1 {
-                        HStack { Text("速率 (U/h)"); TextField("0.50", text: $amount).keyboardType(.decimalPad) }
-                        HStack { Text("时长 (min)"); TextField("60", text: $tbrDuration).keyboardType(.numberPad) }
                     } else {
                         HStack { Text("百分比 (%)"); TextField("100", text: $percent).keyboardType(.numberPad) }
-                        HStack { Text("时长 (min)"); TextField("60", text: $tbrDuration).keyboardType(.numberPad) }
+                        HStack { Text("时长 (min)"); TextField("30", text: $tbrDuration).keyboardType(.numberPad) }
                     }
                 }
                 if !errorText.isEmpty {
@@ -374,23 +371,12 @@ struct InfusionSheet: View {
                                      waveform: waveform == 0 ? nil : waveform)
             if res.ok { sent = true } else { errorText = res.msg }
         case 1:
-            guard let rate = Guard.parseUnits(amount) else { errorText = "速率必须是大于 0 的数字"; return }
-            guard let minutes = Int(tbrDuration.trimmingCharacters(in: .whitespaces)), minutes > 0 else {
-                errorText = "临时基础率时长必须大于 0 分钟"; return
-            }
-            let r = Guard.checkTbr(rate: rate, percent: nil, minutes: minutes,
-                                   remaining: pump.remainingU, switchOn: pump.switchOn,
-                                   sessionUnits: pump.sessionTotal(), waterTest: pump.waterTest)
-            guard r.ok else { errorText = r.msg; return }
-            let res = pump.sendTBR(rate: rate, percent: nil, minutes: minutes)
-            if res.ok { sent = true } else { errorText = res.msg }
-        default:
             guard let p = Int(percent.trimmingCharacters(in: .whitespaces)) else { errorText = "百分比必须是整数"; return }
             guard let minutes = Int(tbrDuration.trimmingCharacters(in: .whitespaces)), minutes > 0 else {
                 errorText = "临时基础率时长必须大于 0 分钟"; return
             }
             guard let basal = pump.basalRateNow else {
-                errorText = "百分比模式要先读基础率：先点「读基础率（0x00F2）」，读到当前时段基础率再用百分比；或改用速率模式"
+                errorText = "百分比模式要先读基础率：先点「读基础率（0x00F2）」，读到当前时段基础率再用百分比"
                 return
             }
             let r = Guard.checkTbr(rate: nil, percent: p, minutes: minutes,
